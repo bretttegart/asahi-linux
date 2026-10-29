@@ -424,7 +424,7 @@ static int apple_smc_probe(struct platform_device *pdev)
 	if (IS_ERR(smc->sram_base))
 		return dev_err_probe(dev, PTR_ERR(smc->sram_base), "Failed to map SRAM region");
 
-	smc->rtk = devm_apple_rtkit_init(dev, smc, NULL, 0, &apple_smc_rtkit_ops);
+	smc->rtk = devm_apple_rtkit_init(dev, smc, NULL, 0, &apple_smc_rtkit_ops, false);
 	if (IS_ERR(smc->rtk))
 		return dev_err_probe(dev, PTR_ERR(smc->rtk), "Failed to initialize RTKit");
 

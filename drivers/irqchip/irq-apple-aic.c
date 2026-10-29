@@ -502,11 +502,11 @@ static void aic_fiq_set_mask(struct irq_data *d)
 	/* Only the guest timers have real mask bits, unfortunately. */
 	switch (aic_fiq_get_idx(d)) {
 	case AIC_TMR_EL02_PHYS:
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENABLE_P, 0);
+		/* T8132 HACK */ if (0) { 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENABLE_P, 0); }
 		isb();
 		break;
 	case AIC_TMR_EL02_VIRT:
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENABLE_V, 0);
+		/* T8132 HACK */ if (0) { 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, VM_TMR_FIQ_ENABLE_V, 0); }
 		isb();
 		break;
 	default:
@@ -518,11 +518,11 @@ static void aic_fiq_clear_mask(struct irq_data *d)
 {
 	switch (aic_fiq_get_idx(d)) {
 	case AIC_TMR_EL02_PHYS:
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_P);
+		/* T8132 HACK */ if (0) { 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_P); }
 		isb();
 		break;
 	case AIC_TMR_EL02_VIRT:
-		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_V);
+		/* T8132 HACK */ if (0) { 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2, 0, VM_TMR_FIQ_ENABLE_V); }
 		isb();
 		break;
 	default:
@@ -869,7 +869,7 @@ static int aic_init_cpu(unsigned int cpu)
 	sysreg_clear_set(cntv_ctl_el0, 0, ARCH_TIMER_CTRL_IT_MASK);
 
 	/* EL2-only (VHE mode) IRQ sources */
-	if (is_kernel_in_hyp_mode()) {
+	if (0 && is_kernel_in_hyp_mode()) { /* T8132 HACK: EL2 tmr/vgic sysregs die on M4 */
 		/* Guest timers */
 		sysreg_clear_set_s(SYS_IMP_APL_VM_TMR_FIQ_ENA_EL2,
 				   VM_TMR_FIQ_ENABLE_V | VM_TMR_FIQ_ENABLE_P, 0);

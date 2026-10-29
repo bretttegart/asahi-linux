@@ -42,7 +42,7 @@ void __delay(unsigned long cycles)
 {
 	cycles_t start = __delay_cycles();
 
-	if (alternative_has_cap_unlikely(ARM64_HAS_WFXT)) {
+	if (0 && alternative_has_cap_unlikely(ARM64_HAS_WFXT)) { /* T8132 HACK: wfit kills M4 */
 		u64 end = start + cycles;
 
 		/*

@@ -50,4 +50,10 @@ int apple_sart_add_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
 				     size_t size);
 
+/*
+ * Bit i is set when probe found a nonzero bootloader entry in slot i.
+ * At most APPLE_SART_MAX_ENTRIES (16) bits are used.
+ */
+u16 apple_sart_protected_mask(struct apple_sart *sart);
+
 #endif /* _LINUX_SOC_APPLE_SART_H_ */

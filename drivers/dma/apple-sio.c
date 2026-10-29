@@ -817,7 +817,7 @@ static int sio_probe(struct platform_device *pdev)
 		return dev_err_probe(&pdev->dev, err,
 				     "pm_runtime_enable failed: %d\n", err);
 
-	sio->rtk = devm_apple_rtkit_init(&pdev->dev, sio, NULL, 0, &sio_rtkit_ops);
+	sio->rtk = devm_apple_rtkit_init(&pdev->dev, sio, NULL, 0, &sio_rtkit_ops, false);
 	if (IS_ERR(sio->rtk)) {
 		err = PTR_ERR(sio->rtk);
 		dev_err(&pdev->dev, "couldn't initialize rtkit\n");

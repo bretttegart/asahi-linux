@@ -245,6 +245,14 @@ struct apple_sart *devm_apple_sart_get(struct device *dev)
 }
 EXPORT_SYMBOL_GPL(devm_apple_sart_get);
 
+u16 apple_sart_protected_mask(struct apple_sart *sart)
+{
+	if (!sart)
+		return 0;
+	return sart->protected_entries & 0xffff;
+}
+EXPORT_SYMBOL_GPL(apple_sart_protected_mask);
+
 static int sart_set_entry(struct apple_sart *sart, int index, u8 flags,
 			  phys_addr_t paddr, size_t size)
 {

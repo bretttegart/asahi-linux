@@ -77,7 +77,8 @@ struct apple_rtkit;
  */
 struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
-					  const struct apple_rtkit_ops *ops);
+					  const struct apple_rtkit_ops *ops,
+					  bool premark_inherited);
 /*
  * Frees internal RTKit state allocated by devm_apple_rtkit_init().
  *
@@ -98,7 +99,8 @@ void devm_apple_rtkit_free(struct device *dev, struct apple_rtkit *rtk);
  */
 struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
-					  const struct apple_rtkit_ops *ops);
+					  const struct apple_rtkit_ops *ops,
+					  bool premark_inherited);
 
 /*
  * Free an instance of apple_rtkit.
@@ -116,6 +118,22 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk);
  * co-processor has been started.
  */
 int apple_rtkit_boot(struct apple_rtkit *rtk);
+
+/*
+ * Adopt a co-processor session that is already running and already
+ * negotiated by a previous stage. Sends no INIT, HELLO, EPMAP, or
+ * power-state message. Returns -EINVAL if the co-processor crashed.
+ * The caller must have verified (CPU running, boot status OK) before
+ * calling; this function performs no hardware check of its own.
+ */
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
+
+/*
+ * Tell a co-processor that is already running that the AP is on.
+ * Does not wait for the endpoint map. iBoot has already exchanged that
+ * before Linux's mailbox is listening.
+ */
+int apple_rtkit_set_ap_power_on(struct apple_rtkit *rtk);
 
 /*
  * Quiesce the co-processor.

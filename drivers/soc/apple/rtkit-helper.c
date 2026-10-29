@@ -104,7 +104,7 @@ static int apple_rtkit_helper_probe(struct platform_device *pdev)
 	}
 
 	helper->rtk =
-		devm_apple_rtkit_init(dev, helper, NULL, 0, &apple_rtkit_helper_ops);
+		devm_apple_rtkit_init(dev, helper, NULL, 0, &apple_rtkit_helper_ops, false);
 	if (IS_ERR(helper->rtk))
 		return dev_err_probe(dev, PTR_ERR(helper->rtk),
 				     "Failed to intialize RTKit");

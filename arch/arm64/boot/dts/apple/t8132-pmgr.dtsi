@@ -793,6 +793,8 @@
 		#power-domain-cells = <0>;
 		#reset-cells = <0>;
 		label = "ans";
+		/* Powering this domain off reboots the machine. */
+		apple,always-on;
 	};
 
 	ps_apcie_st: power-controller@540 {

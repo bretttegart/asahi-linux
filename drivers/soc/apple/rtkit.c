@@ -21,6 +21,8 @@ enum {
 	APPLE_RTKIT_EP_SYSLOG = 2,
 	APPLE_RTKIT_EP_DEBUG = 3,
 	APPLE_RTKIT_EP_IOREPORT = 4,
+	/* Advertised by newer firmware and required to complete RTKit boot. */
+	APPLE_RTKIT_EP_UNKNOWN7 = 7,
 	APPLE_RTKIT_EP_OSLOG = 8,
 	APPLE_RTKIT_EP_TRACEKIT = 0xa,
 };
@@ -60,6 +62,8 @@ enum {
 #define APPLE_RTKIT_BUFFER_REQUEST_IOVA GENMASK_ULL(43, 0)
 
 #define APPLE_RTKIT_SYSLOG_TYPE GENMASK_ULL(59, 52)
+
+#define APPLE_RTKIT_SYSTEM7_BUFFER_REPLY 5
 
 #define APPLE_RTKIT_SYSLOG_LOG 5
 
@@ -191,6 +195,7 @@ static void apple_rtkit_management_rx_epmap(struct apple_rtkit *rtk, u64 msg)
 		case APPLE_RTKIT_EP_CRASHLOG:
 		case APPLE_RTKIT_EP_DEBUG:
 		case APPLE_RTKIT_EP_IOREPORT:
+		case APPLE_RTKIT_EP_UNKNOWN7:
 		case APPLE_RTKIT_EP_OSLOG:
 		case APPLE_RTKIT_EP_TRACEKIT:
 			dev_dbg(rtk->dev,
@@ -309,6 +314,8 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 					    buffer->iova >> 12);
 		} else {
 			reply = FIELD_PREP(APPLE_RTKIT_SYSLOG_TYPE,
+					   ep == APPLE_RTKIT_EP_UNKNOWN7 ?
+					   APPLE_RTKIT_SYSTEM7_BUFFER_REPLY :
 					   APPLE_RTKIT_BUFFER_REQUEST);
 			reply |= FIELD_PREP(APPLE_RTKIT_BUFFER_REQUEST_SIZE,
 					    buffer->size >> 12);
@@ -416,6 +423,21 @@ static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
 		break;
 	default:
 		dev_warn(rtk->dev, "RTKit: Unknown ioreport message: %llx\n",
+			 msg);
+	}
+}
+
+static void apple_rtkit_system7_rx(struct apple_rtkit *rtk, u64 msg)
+{
+	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
+
+	switch (type) {
+	case APPLE_RTKIT_BUFFER_REQUEST:
+		apple_rtkit_common_rx_get_buffer(rtk, &rtk->system7_buffer,
+						 APPLE_RTKIT_EP_UNKNOWN7, msg);
+		break;
+	default:
+		dev_warn(rtk->dev, "RTKit: Unknown system endpoint 7 message: %llx\n",
 			 msg);
 	}
 }
@@ -544,6 +566,9 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 	case APPLE_RTKIT_EP_IOREPORT:
 		apple_rtkit_ioreport_rx(rtk, rtk_work->msg);
 		break;
+	case APPLE_RTKIT_EP_UNKNOWN7:
+		apple_rtkit_system7_rx(rtk, rtk_work->msg);
+		break;
 	case APPLE_RTKIT_EP_OSLOG:
 		apple_rtkit_oslog_rx(rtk, rtk_work->msg);
 		break;
@@ -665,7 +690,8 @@ EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
 struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
-					    const struct apple_rtkit_ops *ops)
+					    const struct apple_rtkit_ops *ops,
+					    bool premark_inherited)
 {
 	struct apple_rtkit *rtk;
 	int ret;
@@ -687,6 +713,21 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
+
+	/* PRE-MARK test (run 2026-10-28-premark, ONE variable): when the
+	 * NVMe probe has an adoption offer, mark the inherited
+	 * crashlog/syslog endpoints discovered HERE, before
+	 * apple_mbox_start() enables the recv IRQ below — so the first
+	 * inherited message can never hit the "undiscovered endpoint"
+	 * path. No STARTEP (contract C1), no INIT/HELLO/EPMAP, no buffer
+	 * handling change: early BUFFER_REQUEST handling is still gated
+	 * on anv->adopted in adopt_running(), not on this bitmap.
+	 * adopt_running() keeps its own set_bit calls (idempotent). */
+	if (premark_inherited) {
+		set_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints);
+		set_bit(APPLE_RTKIT_EP_SYSLOG, rtk->endpoints);
+		dev_info(dev, "RTKit: inherited endpoints 0x01/0x02 pre-marked discovered before mbox_start (no STARTEP)\n");
+	}
 
 	if (mbox_name)
 		rtk->mbox = apple_mbox_get_byname(dev, mbox_name);
@@ -743,6 +784,7 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	flush_workqueue(rtk->wq);
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
+	apple_rtkit_free_buffer(rtk, &rtk->system7_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
@@ -791,6 +833,15 @@ static int apple_rtkit_set_ap_power_state(struct apple_rtkit *rtk,
 	return 0;
 }
 
+int apple_rtkit_set_ap_power_on(struct apple_rtkit *rtk)
+{
+	if (rtk->crashed)
+		return -EINVAL;
+
+	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_set_ap_power_on);
+
 static int apple_rtkit_set_iop_power_state(struct apple_rtkit *rtk,
 					   unsigned int state)
 {
@@ -838,6 +889,37 @@ int apple_rtkit_boot(struct apple_rtkit *rtk)
 	return apple_rtkit_set_ap_power_state(rtk, APPLE_RTKIT_PWR_STATE_ON);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_boot);
+
+/*
+ * Adopt a session that a previous stage already negotiated. Sends NO
+ * management message. The power-state assignments below are internal
+ * bookkeeping ONLY: Linux did not observe these ACKs, the producer
+ * negotiated them. They exist so apple_rtkit_is_running() stops
+ * reporting a live session as dead, and so no path blocks waiting for
+ * a negotiation that already happened. See ADOPTION-2026-10-28.md,
+ * guess G4, for the completion safety note.
+ */
+int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
+{
+	if (rtk->crashed)
+		return -EINVAL;
+
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	complete_all(&rtk->epmap_completion);
+	complete_all(&rtk->iop_pwr_ack_completion);
+	complete_all(&rtk->ap_pwr_ack_completion);
+	/* ADOPTION run 4: mark the inherited crashlog/syslog endpoints as
+	 * discovered WITHOUT starting them: no STARTEP (contract C1 forbids
+	 * STARTEP for inherited endpoints). This silences the "undiscovered
+	 * endpoint" warnings and lets rx dispatch normally. */
+	set_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints);
+	set_bit(APPLE_RTKIT_EP_SYSLOG, rtk->endpoints);
+	dev_info(rtk->dev, "RTKit: inherited endpoints 0x01/0x02 marked discovered (no STARTEP)\n");
+	dev_info(rtk->dev, "RTKit: adopting already-running session (no INIT/HELLO/EPMAP sent)\n");
+	return 0;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_adopt_running);
 
 int apple_rtkit_shutdown(struct apple_rtkit *rtk)
 {
@@ -947,6 +1029,7 @@ void apple_rtkit_free(struct apple_rtkit *rtk)
 	destroy_workqueue(rtk->wq);
 
 	apple_rtkit_free_buffer(rtk, &rtk->ioreport_buffer);
+	apple_rtkit_free_buffer(rtk, &rtk->system7_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->crashlog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->oslog_buffer);
 	apple_rtkit_free_buffer(rtk, &rtk->syslog_buffer);
@@ -963,12 +1046,14 @@ static void apple_rtkit_free_wrapper(void *data)
 
 struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 					  const char *mbox_name, int mbox_idx,
-					  const struct apple_rtkit_ops *ops)
+					  const struct apple_rtkit_ops *ops,
+					  bool premark_inherited)
 {
 	struct apple_rtkit *rtk;
 	int ret;
 
-	rtk = apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops);
+	rtk = apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops,
+				 premark_inherited);
 	if (IS_ERR(rtk))
 		return rtk;
 
