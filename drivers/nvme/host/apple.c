@@ -1246,6 +1246,17 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		    APPLE_ANS_COPROC_CPU_CONTROL_RUN) &&
 		   readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) ==
 		   APPLE_ANS_BOOT_STATUS_OK) {
+		/* DONOR-INTEGRATION P6 (addition, diagnostic ONLY, print-only):
+		 * if CFS is already set at the adoption gate, that is a
+		 * different failure from CFS caused by the enable write —
+		 * but this code deliberately does NOT refuse on it (the
+		 * gate has never seen CFS set in any run, and refusing on
+		 * a transiently-set bit could refuse a boot that would
+		 * have succeeded). It only prints, so a future boot's log
+		 * can discriminate "CFS pre-existing" from "CFS at enable". */
+		if (readl(anv->mmio_nvme + NVME_REG_CSTS) & NVME_CSTS_CFS)
+			dev_err(anv->dev, "ADOPT-PRE-CFS-WARN csts=%08x (CFS already set before enable)\n",
+				readl(anv->mmio_nvme + NVME_REG_CSTS));
 		/* ADOPTION: no INIT, no HELLO/EPMAP, no power renegotiation,
 		 * no SLEEP, no PMGR reset before first I/O. The queue setup
 		 * below runs unchanged on top of the adopted session. */
@@ -1365,14 +1376,25 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	aqa = APPLE_NVME_AQ_DEPTH - 1;
 	aqa |= aqa << 16;
 	writel(aqa, anv->mmio_nvme + NVME_REG_AQA);
-	writeq(anv->adminq.sq_dma_addr, anv->mmio_nvme + NVME_REG_ASQ);
-	writeq(anv->adminq.cq_dma_addr, anv->mmio_nvme + NVME_REG_ACQ);
+	/* DONOR-INTEGRATION P4 (Aurora apple_nvme_writeq / Pro w64lh):
+	 * post-M4 ANS consumes queue and NVMMU TCB base addresses as
+	 * paired 32-bit registers; use lo_hi_writeq (low word, then high
+	 * word) for exactly these four pre-enable writes. NOTE: this was
+	 * already tested ALONE on Oct 28 (lo-hi boot, identical RESET -19
+	 * failure) and refuted as a sole cause — it is included here
+	 * only as part of the coherent whole, not as a re-test of the
+	 * alone hypothesis. Post-enable IOQ writes (after Create SQ)
+	 * are deliberately NOT changed: they occur after enable and
+	 * cannot affect it. <linux/io-64-nonatomic-lo-hi.h> is already
+	 * included at the top of this file. */
+	lo_hi_writeq(anv->adminq.sq_dma_addr, anv->mmio_nvme + NVME_REG_ASQ);
+	lo_hi_writeq(anv->adminq.cq_dma_addr, anv->mmio_nvme + NVME_REG_ACQ);
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
-		writeq(anv->adminq.tcb_dma_addr,
+		lo_hi_writeq(anv->adminq.tcb_dma_addr,
 			anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
-		writeq(anv->ioq.tcb_dma_addr,
+		lo_hi_writeq(anv->ioq.tcb_dma_addr,
 			anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
 	}
 
