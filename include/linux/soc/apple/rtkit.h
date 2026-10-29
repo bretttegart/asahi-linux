@@ -102,6 +102,17 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					  const struct apple_rtkit_ops *ops,
 					  bool premark_inherited);
 
+/* DONOR-INTEGRATION P1: adopted-init (Aurora apple_rtkit_init_adopted).
+ * Equivalent to apple_rtkit_init(..., true): full adopted-init before
+ * mailbox RX is armed. Use for a session a previous stage negotiated. */
+struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
+					    const char *mbox_name, int mbox_idx,
+					    const struct apple_rtkit_ops *ops);
+struct apple_rtkit *devm_apple_rtkit_init_adopted(struct device *dev,
+						 void *cookie,
+						 const char *mbox_name, int mbox_idx,
+						 const struct apple_rtkit_ops *ops);
+
 /*
  * Free an instance of apple_rtkit.
  */

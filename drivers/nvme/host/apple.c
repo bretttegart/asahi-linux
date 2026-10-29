@@ -1945,8 +1945,17 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 		goto put_dev;
 	}
 
-	anv->rtk =
-		devm_apple_rtkit_init(dev, anv, NULL, 0, &apple_nvme_rtkit_ops, anv->adoption_offered);
+	/* DONOR-INTEGRATION P1: an adoption offer uses the adopted-init
+	 * path (mark_running before mbox_start); a non-adoption probe
+	 * keeps the plain init path, unchanged. */
+	if (anv->adoption_offered)
+		anv->rtk =
+			devm_apple_rtkit_init_adopted(dev, anv, NULL, 0,
+						    &apple_nvme_rtkit_ops);
+	else
+		anv->rtk =
+			devm_apple_rtkit_init(dev, anv, NULL, 0,
+					    &apple_nvme_rtkit_ops, false);
 	if (IS_ERR(anv->rtk)) {
 		ret = dev_err_probe(dev, PTR_ERR(anv->rtk),
 				    "Failed to initialize RTKit");

@@ -269,6 +269,7 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 {
 	u64 reply;
 	int err;
+	bool preset_iova;
 
 	/* The different size vs. IOVA shifts look odd but are indeed correct this way */
 	if (ep == APPLE_RTKIT_EP_OSLOG) {
@@ -282,6 +283,13 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 	buffer->buffer = NULL;
 	buffer->iomem = NULL;
 	buffer->is_mapped = false;
+
+	/* DONOR-INTEGRATION P1: a preset IOVA is an inherited buffer from
+	 * a previous owner; a zero IOVA is a fresh request Linux must
+	 * satisfy itself. Record it before shmem_setup() (which may set
+	 * iova for a fresh buffer) so a fresh buffer clears the endpoint's
+	 * inherited flag below. */
+	preset_iova = buffer->iova != 0;
 
 	dev_dbg(rtk->dev, "RTKit: buffer request for 0x%zx bytes at %pad\n",
 		buffer->size, &buffer->iova);
@@ -301,6 +309,26 @@ static int apple_rtkit_common_rx_get_buffer(struct apple_rtkit *rtk,
 		if (!buffer->buffer) {
 			err = -ENOMEM;
 			goto error;
+		}
+	}
+
+	/* DONOR-INTEGRATION P1: a fresh buffer replaces the inherited
+	 * session for this endpoint, so its inherited flag clears. A
+	 * preset (inherited) buffer keeps the flag: later rx handling
+	 * must not treat it as a fresh, CPU-visible buffer. */
+	if (!preset_iova) {
+		switch (ep) {
+		case APPLE_RTKIT_EP_CRASHLOG:
+			rtk->crashlog_inherited = false;
+			break;
+		case APPLE_RTKIT_EP_SYSLOG:
+			rtk->syslog_inherited = false;
+			break;
+		case APPLE_RTKIT_EP_OSLOG:
+			rtk->oslog_inherited = false;
+			break;
+		default:
+			break;
 		}
 	}
 
@@ -384,6 +412,19 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 		return;
 	}
 
+	/* DONOR-INTEGRATION P1 (Aurora inherited-crashlog): a crash
+	 * message for an inherited buffer that Linux never mapped for CPU
+	 * access must NOT be re-read as a new crash — the shadow copy
+	 * below would memcpy from a NULL buffer pointer. Do not set
+	 * crashed, do not call ops->crashed. Once a fresh buffer is
+	 * installed, crashlog_inherited clears and this guard stops
+	 * applying. */
+	if (rtk->crashlog_inherited && !rtk->crashlog_buffer.buffer &&
+	    !rtk->crashlog_buffer.iomem) {
+		dev_warn(rtk->dev, "RTKit: inherited crashlog message: buffer not CPU-visible, not re-read as new crash\n");
+		return;
+	}
+
 	dev_err(rtk->dev, "RTKit: co-processor has crashed\n");
 
 	/*
@@ -444,10 +485,18 @@ static void apple_rtkit_system7_rx(struct apple_rtkit *rtk, u64 msg)
 
 static void apple_rtkit_syslog_rx_init(struct apple_rtkit *rtk, u64 msg)
 {
+	/* DONOR-INTEGRATION P1 (Aurora inherited-syslog): an inherited
+	 * session never saw SYSLOG_INIT, so a ring received after adoption
+	 * cannot be interpreted from producer state alone. A SYSLOG_INIT
+	 * arriving now IS a fresh ring start: handle it normally, then
+	 * clear the inherited flag — later LOG messages are interpretable. */
+	if (rtk->syslog_inherited)
+		dev_info(rtk->dev, "RTKit: SYSLOG_INIT after adoption: inherited ring replaced by fresh init\n");
 	rtk->syslog_n_entries = FIELD_GET(APPLE_RTKIT_SYSLOG_N_ENTRIES, msg);
 	rtk->syslog_msg_size = FIELD_GET(APPLE_RTKIT_SYSLOG_MSG_SIZE, msg);
 
 	rtk->syslog_msg_buffer = kzalloc(rtk->syslog_msg_size, GFP_KERNEL);
+	rtk->syslog_inherited = false;
 
 	dev_dbg(rtk->dev,
 		"RTKit: syslog initialized: entries: %zd, msg_size: %zd\n",
@@ -470,6 +519,11 @@ static void apple_rtkit_syslog_rx_log(struct apple_rtkit *rtk, u64 msg)
 		dev_warn(
 			rtk->dev,
 			"RTKit: received syslog message but no syslog_msg_buffer\n");
+		/* DONOR-INTEGRATION P1: an inherited LOG is still ACKed below
+		 * (goto done sends the echo), exactly as Aurora requires for an
+		 * uninterpretable inherited ring — it must not stall firmware. */
+		if (rtk->syslog_inherited)
+			dev_dbg(rtk->dev, "RTKit: inherited syslog LOG acked without interpretable ring\n");
 		goto done;
 	}
 	if (!rtk->syslog_buffer.size) {
@@ -688,6 +742,40 @@ int apple_rtkit_start_ep(struct apple_rtkit *rtk, u8 endpoint)
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_start_ep);
 
+/*
+ * DONOR-INTEGRATION P1 (Aurora adopted-init, adapted from
+ * aurora-silicon/linux @ d266c703 drivers/soc/apple/rtkit.c
+ * __apple_rtkit_init() L1381-1389 / apple_rtkit_mark_running()):
+ * mark a session that a previous stage already negotiated as running,
+ * BEFORE mailbox RX is armed. Aurora calls mark_running before
+ * claim_rx() and mbox_start() with the comment that inherited system
+ * traffic may arrive as soon as RX is armed. J604 has no separate
+ * claim_rx: the equivalent arm points are mbox->rx assignment and
+ * apple_mbox_start() in apple_rtkit_init() below, so this runs before
+ * both. Sets system endpoints, IOP/AP power ON, completes the
+ * epmap/power completions, and sets the inherited flags. Sends NO
+ * message, no STARTEP, no INIT/HELLO/EPMAP.
+ */
+static void apple_rtkit_mark_running(struct apple_rtkit *rtk)
+{
+	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
+	complete_all(&rtk->epmap_completion);
+	complete_all(&rtk->iop_pwr_ack_completion);
+	complete_all(&rtk->ap_pwr_ack_completion);
+	set_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints);
+	set_bit(APPLE_RTKIT_EP_SYSLOG, rtk->endpoints);
+	set_bit(APPLE_RTKIT_EP_DEBUG, rtk->endpoints);
+	set_bit(APPLE_RTKIT_EP_IOREPORT, rtk->endpoints);
+	set_bit(APPLE_RTKIT_EP_UNKNOWN7, rtk->endpoints);
+	set_bit(APPLE_RTKIT_EP_OSLOG, rtk->endpoints);
+	set_bit(APPLE_RTKIT_EP_TRACEKIT, rtk->endpoints);
+	rtk->crashlog_inherited = true;
+	rtk->syslog_inherited = true;
+	rtk->oslog_inherited = true;
+	dev_info(rtk->dev, "RTKit: adopted-init mark_running before mbox_start (inherited session, no INIT/HELLO/EPMAP)\n");
+}
+
 struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 					    const char *mbox_name, int mbox_idx,
 					    const struct apple_rtkit_ops *ops,
@@ -714,20 +802,14 @@ struct apple_rtkit *apple_rtkit_init(struct device *dev, void *cookie,
 	bitmap_zero(rtk->endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 	set_bit(APPLE_RTKIT_EP_MGMT, rtk->endpoints);
 
-	/* PRE-MARK test (run 2026-10-28-premark, ONE variable): when the
-	 * NVMe probe has an adoption offer, mark the inherited
-	 * crashlog/syslog endpoints discovered HERE, before
-	 * apple_mbox_start() enables the recv IRQ below — so the first
-	 * inherited message can never hit the "undiscovered endpoint"
-	 * path. No STARTEP (contract C1), no INIT/HELLO/EPMAP, no buffer
-	 * handling change: early BUFFER_REQUEST handling is still gated
-	 * on anv->adopted in adopt_running(), not on this bitmap.
-	 * adopt_running() keeps its own set_bit calls (idempotent). */
-	if (premark_inherited) {
-		set_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints);
-		set_bit(APPLE_RTKIT_EP_SYSLOG, rtk->endpoints);
-		dev_info(dev, "RTKit: inherited endpoints 0x01/0x02 pre-marked discovered before mbox_start (no STARTEP)\n");
-	}
+	/* DONOR-INTEGRATION P1: the Oct 28 pre-mark test's 2 endpoint bits
+	 * are now a subset of apple_rtkit_mark_running() above (full
+	 * adopted-init: power, completions, system endpoints, inherited
+	 * flags), still before apple_mbox_start() below. No STARTEP,
+	 * no INIT/HELLO/EPMAP. adopt_running() re-applies the same state
+	 * idempotently in reset_work. */
+	if (premark_inherited)
+		apple_rtkit_mark_running(rtk);
 
 	if (mbox_name)
 		rtk->mbox = apple_mbox_get_byname(dev, mbox_name);
@@ -762,6 +844,21 @@ free_rtk:
 	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_GPL(apple_rtkit_init);
+
+/*
+ * DONOR-INTEGRATION P1: Aurora's apple_rtkit_init_adopted() (rtkit.c
+ * L1415, calling __apple_rtkit_init(..., true, NULL, 0)). J604's
+ * equivalent is apple_rtkit_init(..., premark_inherited=true), which
+ * now performs full adopted-init; this wrapper names that path so
+ * callers state intent instead of passing a boolean flag.
+ */
+struct apple_rtkit *apple_rtkit_init_adopted(struct device *dev, void *cookie,
+					    const char *mbox_name, int mbox_idx,
+					    const struct apple_rtkit_ops *ops)
+{
+	return apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_init_adopted);
 
 static int apple_rtkit_wait_for_completion(struct completion *c)
 {
@@ -803,6 +900,9 @@ int apple_rtkit_reinit(struct apple_rtkit *rtk)
 	reinit_completion(&rtk->ap_pwr_ack_completion);
 
 	rtk->crashed = false;
+	rtk->crashlog_inherited = false;
+	rtk->syslog_inherited = false;
+	rtk->oslog_inherited = false;
 	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_OFF;
 
@@ -904,17 +1004,15 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk)
 	if (rtk->crashed)
 		return -EINVAL;
 
-	rtk->iop_power_state = APPLE_RTKIT_PWR_STATE_ON;
-	rtk->ap_power_state = APPLE_RTKIT_PWR_STATE_ON;
-	complete_all(&rtk->epmap_completion);
-	complete_all(&rtk->iop_pwr_ack_completion);
-	complete_all(&rtk->ap_pwr_ack_completion);
+	/* DONOR-INTEGRATION P1: adopt_running() converges on the same
+	 * state mark_running() set at probe time (idempotent if probe
+	 * already marked it). Kept as the authoritative convergence point
+	 * in case an offer is only recognised at reset_work time. */
+	apple_rtkit_mark_running(rtk);
 	/* ADOPTION run 4: mark the inherited crashlog/syslog endpoints as
 	 * discovered WITHOUT starting them: no STARTEP (contract C1 forbids
 	 * STARTEP for inherited endpoints). This silences the "undiscovered
 	 * endpoint" warnings and lets rx dispatch normally. */
-	set_bit(APPLE_RTKIT_EP_CRASHLOG, rtk->endpoints);
-	set_bit(APPLE_RTKIT_EP_SYSLOG, rtk->endpoints);
 	dev_info(rtk->dev, "RTKit: inherited endpoints 0x01/0x02 marked discovered (no STARTEP)\n");
 	dev_info(rtk->dev, "RTKit: adopting already-running session (no INIT/HELLO/EPMAP sent)\n");
 	return 0;
@@ -1064,6 +1162,27 @@ struct apple_rtkit *devm_apple_rtkit_init(struct device *dev, void *cookie,
 	return rtk;
 }
 EXPORT_SYMBOL_GPL(devm_apple_rtkit_init);
+
+/* DONOR-INTEGRATION P1: devm version of apple_rtkit_init_adopted(). */
+struct apple_rtkit *devm_apple_rtkit_init_adopted(struct device *dev,
+						 void *cookie,
+						 const char *mbox_name, int mbox_idx,
+						 const struct apple_rtkit_ops *ops)
+{
+	struct apple_rtkit *rtk;
+	int ret;
+
+	rtk = apple_rtkit_init(dev, cookie, mbox_name, mbox_idx, ops, true);
+	if (IS_ERR(rtk))
+		return rtk;
+
+	ret = devm_add_action_or_reset(dev, apple_rtkit_free_wrapper, rtk);
+	if (ret)
+		return ERR_PTR(ret);
+
+	return rtk;
+}
+EXPORT_SYMBOL_GPL(devm_apple_rtkit_init_adopted);
 
 void devm_apple_rtkit_free(struct device *dev, struct apple_rtkit *rtk)
 {

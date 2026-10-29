@@ -40,6 +40,14 @@ struct apple_rtkit {
 	unsigned int ap_power_state;
 	bool crashed;
 
+	/* DONOR-INTEGRATION P1 (Aurora inherited flags, adapted):
+	 * true while this endpoint's buffer/state still belongs to the
+	 * producer session. Cleared when a fresh (non-preset) buffer is
+	 * installed for that endpoint, or by reinit (fresh session). */
+	bool crashlog_inherited;
+	bool syslog_inherited;
+	bool oslog_inherited;
+
 	DECLARE_BITMAP(endpoints, APPLE_RTKIT_MAX_ENDPOINTS);
 
 	struct apple_rtkit_shmem ioreport_buffer;
