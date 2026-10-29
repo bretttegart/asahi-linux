@@ -269,9 +269,26 @@ static int apple_nvme_sart_dma_setup(void *cookie,
 		 * session. SART-allow the preset range so the RTKit layer sends
 		 * the buffer reply (reply path uses iova/size only, never
 		 * dereferences bfr->buffer). Adopted mode only; the non-adopted
-		 * path still rejects a preset IOVA with -EINVAL. */
-		if (!anv->adopted)
+		 * path still rejects a preset IOVA with -EINVAL.
+		 * DONOR-INTEGRATION P2 (broader early-buffer theory): the
+		 * adoption OFFER is known at probe time, long before
+		 * reset_work sets adopted=true. A BUFFER_REQUEST arriving
+		 * between probe (mbox_start) and adopt_running() is therefore
+		 * still a producer-session request, not a fresh-session
+		 * error — refusing it with -EINVAL sends NO reply (see
+		 * common_rx_get_buffer error path), which can stall the
+		 * firmware side that is waiting for the buffer reply.
+		 * Accept a preset IOVA when an offer is present, adopted or
+		 * not yet adopted; the handling is identical (SART-allow
+		 * only, buffer stays NULL, reply uses iova/size only), so
+		 * no new dereference risk is introduced. The dev_info line
+		 * below is the discriminating evidence for a future boot:
+		 * it fires only if a request actually arrives pre-adopt. */
+		if (!anv->adopted && !anv->adoption_offered)
 			return -EINVAL;
+		if (!anv->adopted)
+			dev_info(anv->dev, "ADOPT-EARLY-BUFFER iova=%pad size=0x%zx (pre-adopt, offer present)\n",
+				 &bfr->iova, bfr->size);
 		if (!bfr->size)
 			return -EINVAL;
 		ret = apple_sart_add_allowed_region(anv->sart, bfr->iova,
