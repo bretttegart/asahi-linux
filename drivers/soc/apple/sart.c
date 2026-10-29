@@ -253,6 +253,33 @@ u16 apple_sart_protected_mask(struct apple_sart *sart)
 }
 EXPORT_SYMBOL_GPL(apple_sart_protected_mask);
 
+/* DONOR-INTEGRATION P3: containment in a single protected entry.
+ * Protected entries are the bootloader entries probe recorded (nonzero
+ * flags). A range straddling two entries is not contained. */
+bool apple_sart_is_protected_region(struct apple_sart *sart,
+				    phys_addr_t paddr, size_t size)
+{
+	int i;
+
+	if (!sart || !size)
+		return false;
+
+	for (i = 0; i < APPLE_SART_MAX_ENTRIES; ++i) {
+		u8 flags;
+		phys_addr_t epaddr;
+		size_t esize;
+
+		if (!test_bit(i, &sart->protected_entries))
+			continue;
+		sart->ops->get_entry(sart, i, &flags, &epaddr, &esize);
+		if (paddr >= epaddr && paddr - epaddr <= esize &&
+		    size <= esize - (paddr - epaddr))
+			return true;
+	}
+	return false;
+}
+EXPORT_SYMBOL_GPL(apple_sart_is_protected_region);
+
 static int sart_set_entry(struct apple_sart *sart, int index, u8 flags,
 			  phys_addr_t paddr, size_t size)
 {

@@ -224,6 +224,18 @@ unsigned int flush_interval = 1000;
 module_param(flush_interval, uint, 0644);
 MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
 
+/* DONOR-INTEGRATION P3: strict inherited-buffer validation, DEFAULT OFF.
+ * When true, a preset (inherited) IOVA is accepted only if it is
+ * 4 KiB-aligned, its size is 4 KiB-aligned, and the range lies inside
+ * one bootloader-protected SART entry. Off by default because it is
+ * NOT proven that the producer's syslog/crashlog buffers sit inside
+ * protected SART entries — enabling it blindly could reject a
+ * legitimate inherited buffer and break adoption. See the P3 section
+ * of donor-integration-2026-10-29.md before turning this on. */
+static bool adopt_strict_buffers;
+module_param(adopt_strict_buffers, bool, 0644);
+MODULE_PARM_DESC(adopt_strict_buffers, "Strict inherited-buffer validation for adoption (default off)");
+
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
 
@@ -258,6 +270,31 @@ static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t 
 	nvme_reset_ctrl(&anv->ctrl);
 }
 
+/* DONOR-INTEGRATION P3 (Aurora inherited-buffer validation, adapted):
+ * Aurora (apple_nvme_sart_dma_setup) validates a preset IOVA
+ * page-by-page: no overflow, cache-line alignment, inside an inherited
+ * SART region, every page reserved, in the linear map, not highmem,
+ * then memremaps + dma_maps and rejects if the DMA address != the
+ * firmware identity IOVA. J604's SART model has no remapping: the
+ * allow-list IS the identity mapping, so a separate identity-IOVA
+ * check is vacuous here (there is no mapped address to compare).
+ * What ports cleanly is: 4 KiB alignment (SART v3 granularity) +
+ * protected-region containment (new sart API above). The linear-map /
+ * reserved-page checks are NOT ported: J604 never CPU-maps an
+ * inherited buffer (buffer stays NULL), so they would validate a
+ * mapping that does not exist. */
+static int apple_nvme_validate_inherited_buffer(struct apple_nvme *anv,
+						struct apple_rtkit_shmem *bfr)
+{
+	if (!bfr->size)
+		return -EINVAL;
+	if (bfr->iova & 0xfff || bfr->size & 0xfff)
+		return -EINVAL;
+	if (!apple_sart_is_protected_region(anv->sart, bfr->iova, bfr->size))
+		return -EINVAL;
+	return 0;
+}
+
 static int apple_nvme_sart_dma_setup(void *cookie,
 				     struct apple_rtkit_shmem *bfr)
 {
@@ -289,6 +326,16 @@ static int apple_nvme_sart_dma_setup(void *cookie,
 		if (!anv->adopted)
 			dev_info(anv->dev, "ADOPT-EARLY-BUFFER iova=%pad size=0x%zx (pre-adopt, offer present)\n",
 				 &bfr->iova, bfr->size);
+		/* DONOR-INTEGRATION P3: strict validation is a flagged variant
+		 * only (adopt_strict_buffers=1). Default path below is unchanged. */
+		if (adopt_strict_buffers) {
+			ret = apple_nvme_validate_inherited_buffer(anv, bfr);
+			if (ret) {
+				dev_warn(anv->dev, "ADOPT-STRICT-BUFFER reject iova=%pad size=0x%zx\n",
+					 &bfr->iova, bfr->size);
+				return ret;
+			}
+		}
 		if (!bfr->size)
 			return -EINVAL;
 		ret = apple_sart_add_allowed_region(anv->sart, bfr->iova,

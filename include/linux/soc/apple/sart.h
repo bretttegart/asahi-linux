@@ -56,4 +56,10 @@ int apple_sart_remove_allowed_region(struct apple_sart *sart, phys_addr_t paddr,
  */
 u16 apple_sart_protected_mask(struct apple_sart *sart);
 
+/* DONOR-INTEGRATION P3: true iff [paddr, paddr+size) lies entirely
+ * inside one bootloader-protected SART entry. Used only by the
+ * flagged strict inherited-buffer validation (default off). */
+bool apple_sart_is_protected_region(struct apple_sart *sart,
+				    phys_addr_t paddr, size_t size);
+
 #endif /* _LINUX_SOC_APPLE_SART_H_ */
