@@ -23,6 +23,7 @@
 #include <linux/mempool.h>
 #include <linux/module.h>
 #include <linux/of.h>
+#include <linux/memblock.h>
 #include <linux/of_platform.h>
 #include <linux/once.h>
 #include <linux/platform_device.h>
@@ -194,6 +195,14 @@ struct apple_nvme {
 	bool adoption_offered;
 	enum { ADOPTION_MODE_NONE = 0, ADOPTION_MODE_DISABLED, ADOPTION_MODE_ENABLED } adoption_mode;
 	bool adopted;
+	/* J604 REUSE (Amendment A3): producer admin queue addresses from
+	 * /chosen, valid only when adoption_offered. reuse_active is set
+	 * in reset_work when the substitution actually runs. */
+	u64 reuse_admin_sq;
+	u64 reuse_admin_cq;
+	u64 reuse_admin_tcb;
+	bool reuse_admin_valid;
+	bool reuse_active;
 
 	struct dma_pool *prp_page_pool;
 	struct dma_pool *prp_small_pool;
@@ -235,6 +244,15 @@ MODULE_PARM_DESC(flush_interval, "Grace period in msecs between flushes");
 static bool adopt_strict_buffers;
 module_param(adopt_strict_buffers, bool, 0644);
 MODULE_PARM_DESC(adopt_strict_buffers, "Strict inherited-buffer validation for adoption (default off)");
+
+/* J604 REUSE (Amendment A3, default OFF): when true AND an adoption
+ * offer carries the producer admin queue addresses, program those
+ * addresses (ASQ/ACQ/NVMMU ASQ_TCB_BASE) instead of fresh allocations.
+ * IOSQ_TCB_BASE stays fresh (single-variable rule). Enable via cmdline:
+ * nvme_apple.adopt_reuse_admin_queues=1 */
+static bool adopt_reuse_admin_queues;
+module_param(adopt_reuse_admin_queues, bool, 0644);
+MODULE_PARM_DESC(adopt_reuse_admin_queues, "Reuse producer admin queue addresses on adoption (default off)");
 
 static_assert(sizeof(struct nvme_command) == 64);
 static_assert(sizeof(struct apple_nvmmu_tcb) == 128);
@@ -1147,6 +1165,25 @@ static void apple_nvme_init_queue(struct apple_nvme_queue *q)
 	wmb(); /* ensure the first interrupt sees the initialization */
 }
 
+/* J604 REUSE (A3) Gate 1 helper: an address is reusable only if it is
+ * non-zero, 16K-aligned (producer allocations are memalign 16K), and
+ * inside a memblock reserved range (the producer's retained ranges
+ * arrive as FDT memreserves). */
+static bool reuse_addr_ok(u64 addr)
+{
+	u64 i;
+	phys_addr_t rs, re;
+
+	if (!addr || (addr & 0x3fff))
+		return false;
+	__for_each_mem_range(i, &memblock.reserved, NULL, NUMA_NO_NODE, 0,
+			     &rs, &re, NULL) {
+		if (addr >= rs && addr < re)
+			return true;
+	}
+	return false;
+}
+
 static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
@@ -1387,15 +1424,57 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	 * are deliberately NOT changed: they occur after enable and
 	 * cannot affect it. <linux/io-64-nonatomic-lo-hi.h> is already
 	 * included at the top of this file. */
-	lo_hi_writeq(anv->adminq.sq_dma_addr, anv->mmio_nvme + NVME_REG_ASQ);
-	lo_hi_writeq(anv->adminq.cq_dma_addr, anv->mmio_nvme + NVME_REG_ACQ);
+	/* J604 REUSE (A3): admin-address substitution, gated. Fresh
+	 * addresses are the default; the published addresses are used
+	 * only when adoption was offered, the flag is on, the offer
+	 * carried all three addresses, and Gate 1 passes. Gate 1
+	 * failure refuses the run (no silent fallback).
+	 * IOSQ_TCB_BASE always stays fresh (single-variable rule). */
+	{
+		dma_addr_t sq_addr = anv->adminq.sq_dma_addr;
+		dma_addr_t cq_addr = anv->adminq.cq_dma_addr;
+		dma_addr_t asq_tcb = anv->adminq.tcb_dma_addr;
+		bool reuse = false;
 
-	if (anv->hw->has_lsq_nvmmu) {
-		/* Setup NVMMU for both queues */
-		lo_hi_writeq(anv->adminq.tcb_dma_addr,
-			anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
-		lo_hi_writeq(anv->ioq.tcb_dma_addr,
-			anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
+		if (anv->adoption_offered && adopt_reuse_admin_queues) {
+			if (!anv->reuse_admin_valid) {
+				dev_err(anv->dev, "ADOPT-REUSE-REFUSED reason=no-offer\n");
+				ret = -ENODEV;
+				goto out;
+			}
+			if (!reuse_addr_ok(anv->reuse_admin_sq) ||
+			    !reuse_addr_ok(anv->reuse_admin_cq) ||
+			    !reuse_addr_ok(anv->reuse_admin_tcb) ||
+			    anv->reuse_admin_sq == sq_addr ||
+			    anv->reuse_admin_cq == cq_addr ||
+			    anv->reuse_admin_tcb == asq_tcb) {
+				dev_err(anv->dev, "ADOPT-REUSE-REFUSED reason=gate1 sq=%016llx cq=%016llx tcb=%016llx\n",
+					(unsigned long long)anv->reuse_admin_sq,
+					(unsigned long long)anv->reuse_admin_cq,
+					(unsigned long long)anv->reuse_admin_tcb);
+				ret = -ENODEV;
+				goto out;
+			}
+			sq_addr = anv->reuse_admin_sq;
+			cq_addr = anv->reuse_admin_cq;
+			asq_tcb = anv->reuse_admin_tcb;
+			reuse = true;
+			dev_err(anv->dev, "ADOPT-REUSE sq=%016llx cq=%016llx tcb=%016llx fresh-sq=%pad fresh-cq=%pad fresh-tcb=%pad\n",
+				(unsigned long long)sq_addr, (unsigned long long)cq_addr,
+				(unsigned long long)asq_tcb, &anv->adminq.sq_dma_addr,
+				&anv->adminq.cq_dma_addr, &anv->adminq.tcb_dma_addr);
+		}
+		lo_hi_writeq(sq_addr, anv->mmio_nvme + NVME_REG_ASQ);
+		lo_hi_writeq(cq_addr, anv->mmio_nvme + NVME_REG_ACQ);
+
+		if (anv->hw->has_lsq_nvmmu) {
+			/* Setup NVMMU for both queues */
+			lo_hi_writeq(asq_tcb,
+				anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
+			lo_hi_writeq(anv->ioq.tcb_dma_addr,
+				anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
+		}
+		anv->reuse_active = reuse;
 	}
 
 	anv->ctrl.sqsize =
@@ -1431,6 +1510,24 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		readl(anv->mmio_nvme + NVME_REG_CSTS));
 	dev_err(anv->dev, "NVME-RB intended aqa=%08x asq=%pad acq=%pad asq_db=0 iosq_db=0\n",
 		aqa, &anv->adminq.sq_dma_addr, &anv->adminq.cq_dma_addr);
+	/* J604 REUSE (A3) Gate 2 (recording only, not a stop gate):
+	 * confirm the programmed addresses equal the published ones. */
+	if (anv->reuse_active) {
+		u64 rb_asq = readq(anv->mmio_nvme + NVME_REG_ASQ);
+		u64 rb_acq = readq(anv->mmio_nvme + NVME_REG_ACQ);
+		u64 rb_tcb = anv->hw->has_lsq_nvmmu ?
+			readq(anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE) : 0;
+		if (rb_asq == anv->reuse_admin_sq && rb_acq == anv->reuse_admin_cq &&
+		    (!anv->hw->has_lsq_nvmmu || rb_tcb == anv->reuse_admin_tcb))
+			dev_err(anv->dev, "ADOPT-REUSE-RB-OK asq=%016llx acq=%016llx tcb=%016llx\n",
+				(unsigned long long)rb_asq, (unsigned long long)rb_acq,
+				(unsigned long long)rb_tcb);
+		else
+			dev_err(anv->dev, "ADOPT-REUSE-RB-MISMATCH rb-asq=%016llx rb-acq=%016llx rb-tcb=%016llx pub-sq=%016llx pub-cq=%016llx pub-tcb=%016llx (run uninterpretable as reuse)\n",
+				(unsigned long long)rb_asq, (unsigned long long)rb_acq,
+				(unsigned long long)rb_tcb, (unsigned long long)anv->reuse_admin_sq,
+				(unsigned long long)anv->reuse_admin_cq, (unsigned long long)anv->reuse_admin_tcb);
+	}
 	/* RUN 6 TCB-CONTENTS DUMP ONLY: read-only, immediately before enable.
 	 * Kept alongside the run-5 readback (also read-only, unchanged).
 	 * Intended pre-enable contents: TCB memory is allocated at probe
@@ -1970,6 +2067,28 @@ static struct apple_nvme *apple_nvme_alloc(struct platform_device *pdev)
 				anv->adoption_offered = true;
 				anv->adoption_mode = strcmp(state, "enabled") ? ADOPTION_MODE_DISABLED : ADOPTION_MODE_ENABLED;
 				dev_err(dev, "ADOPT-OFFERED controller-state=%s\n", state);
+				/* J604 REUSE (A3): read the producer admin queue
+				 * addresses. Absent here only means no reuse
+				 * offer; the substitution gate in reset_work
+				 * refuses unless all three are present and
+				 * pass Gate 1. */
+				{
+					u64 sq = 0, cq = 0, tcb = 0;
+					if (!of_property_read_u64(chosen, "j604,ans-admin-sq", &sq) &&
+					    !of_property_read_u64(chosen, "j604,ans-admin-cq", &cq) &&
+					    !of_property_read_u64(chosen, "j604,ans-admin-tcb", &tcb) &&
+					    sq && cq && tcb) {
+						anv->reuse_admin_sq = sq;
+						anv->reuse_admin_cq = cq;
+						anv->reuse_admin_tcb = tcb;
+						anv->reuse_admin_valid = true;
+						dev_err(dev, "ADOPT-REUSE-OFFER sq=%016llx cq=%016llx tcb=%016llx\n",
+							(unsigned long long)sq, (unsigned long long)cq,
+							(unsigned long long)tcb);
+					} else {
+						dev_err(dev, "ADOPT-REUSE-ABSENT (no producer admin addresses)\n");
+					}
+				}
 			}
 			of_node_put(chosen);
 		}
