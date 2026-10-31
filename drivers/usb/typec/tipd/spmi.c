@@ -167,6 +167,7 @@ static int sn201202x_probe(struct spmi_device *device)
 	int ret;
 
 	match = of_match_device(sn201202x_of_match, &device->dev);
+	dev_err(&device->dev, "TIPD-PROBE-ENTER\n");
 	if (!match)
 		return -EINVAL;
 	data = match->data;
@@ -212,9 +213,11 @@ static int sn201202x_probe(struct spmi_device *device)
 		return ret;
 
 	spmi_device_set_drvdata(device, tps);
+	dev_err(&device->dev, "TIPD-PROBE-IRQ-OK\n");
 	tps->regmap = devm_regmap_init_sn201202x(device, &tps6598x_regmap_config);
 	if (IS_ERR(tps->regmap))
 		return PTR_ERR(tps->regmap);
+	dev_err(&device->dev, "TIPD-PROBE-REGMAP-OK\n");
 
 	ret = spmi_command_wakeup(device);
 	if (ret)
@@ -223,8 +226,10 @@ static int sn201202x_probe(struct spmi_device *device)
 		return -ETIMEDOUT;
 
 	ret = tipd_init(tps);
+	dev_err(&device->dev, "TIPD-PROBE-WAKE-OK\n");
 	if (ret)
 		spmi_command_sleep(device);
+	dev_err(&device->dev, "TIPD-PROBE-DONE\n");
 	return ret;
 }
 

@@ -416,6 +416,7 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 	}
 
 	spmi->irqd = devm_irq_domain_instantiate(&pdev->dev, &info);
+	dev_err(&pdev->dev, "SPMI-PROBE-IRQ-SETUP\n");
 	if (IS_ERR(spmi->irqd))
 		return PTR_ERR(spmi->irqd);
 
@@ -426,6 +427,7 @@ static int apple_spmi_init_irq(struct platform_device *pdev,
 
 	irq_set_chained_handler_and_data(spmi->irq, apple_spmi_irq_handler, spmi);
 	apple_spmi_irq_unmask_raw(spmi, SPMI_IRQ_NOTIFY);
+	dev_err(&pdev->dev, "SPMI-PROBE-IRQ-OK\n");
 
 	return 0;
 }
@@ -434,6 +436,7 @@ static int apple_spmi_probe(struct platform_device *pdev)
 {
 	struct apple_spmi *spmi;
 	struct spmi_controller *ctrl;
+	struct resource *res;
 	int ret;
 
 	ctrl = devm_spmi_controller_alloc(&pdev->dev, sizeof(*spmi));
@@ -444,10 +447,14 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	mutex_init(&spmi->fifo_lock);
 	init_completion(&spmi->fifo_rx);
 	platform_set_drvdata(pdev, spmi);
+	dev_err(&pdev->dev, "SPMI-PROBE-ENTER\n");
 
-	spmi->regs = devm_platform_ioremap_resource(pdev, 0);
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	dev_err(&pdev->dev, "SPMI-PROBE-RES-OK\n");
+	spmi->regs = devm_ioremap_resource(&pdev->dev, res);
 	if (IS_ERR(spmi->regs))
 		return PTR_ERR(spmi->regs);
+	dev_err(&pdev->dev, "SPMI-PROBE-IOREMAP-OK\n");
 
 	ctrl->dev.of_node = pdev->dev.of_node;
 
@@ -465,9 +472,11 @@ static int apple_spmi_probe(struct platform_device *pdev)
 	}
 
 	ret = devm_spmi_controller_add(&pdev->dev, ctrl);
+	dev_err(&pdev->dev, "SPMI-ADD-ATTEMPT\n");
 	if (ret)
 		return dev_err_probe(&pdev->dev, ret,
 				     "spmi_controller_add failed\n");
+	dev_err(&pdev->dev, "SPMI-PROBE-ADD-OK\n");
 
 	return 0;
 }

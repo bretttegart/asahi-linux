@@ -484,6 +484,7 @@ static void of_spmi_register_devices(struct spmi_controller *ctrl)
 
 	if (!ctrl->dev.of_node)
 		return;
+	dev_err(&ctrl->dev, "SPMI-CTRL-CHILDREN-START\n");
 
 	for_each_available_child_of_node(ctrl->dev.of_node, node) {
 		struct spmi_device *sdev;
@@ -521,6 +522,7 @@ static void of_spmi_register_devices(struct spmi_controller *ctrl)
 		sdev->usid = (u8)reg[0];
 
 		err = spmi_device_add(sdev);
+		dev_err(&ctrl->dev, "SPMI-CHILD-ADD usid=%02x err=%d\n", reg[0], err);
 		if (err) {
 			dev_err(&sdev->dev,
 				"failure adding device. status %d\n", err);
@@ -547,12 +549,14 @@ int spmi_controller_add(struct spmi_controller *ctrl)
 	ret = device_add(&ctrl->dev);
 	if (ret)
 		return ret;
+	dev_err(&ctrl->dev, "SPMI-CTRL-DEVADD-OK\n");
 
 	if (IS_ENABLED(CONFIG_OF))
 		of_spmi_register_devices(ctrl);
 
 	dev_dbg(&ctrl->dev, "spmi-%d registered: dev:%p\n",
 		ctrl->nr, &ctrl->dev);
+	dev_err(&ctrl->dev, "SPMI-CTRL-CHILDREN-DONE\n");
 
 	return 0;
 };
