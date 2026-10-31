@@ -5,10 +5,6 @@
  */
 #include "rtkit-internal.h"
 
-#define FOURCC(a, b, c, d) \
-	(((u32)(a) << 24) | ((u32)(b) << 16) | ((u32)(c) << 8) | ((u32)(d)))
-
-#define APPLE_RTKIT_CRASHLOG_HEADER FOURCC('C', 'L', 'H', 'E')
 #define APPLE_RTKIT_CRASHLOG_STR FOURCC('C', 's', 't', 'r')
 #define APPLE_RTKIT_CRASHLOG_VERSION FOURCC('C', 'v', 'e', 'r')
 #define APPLE_RTKIT_CRASHLOG_MBOX FOURCC('C', 'm', 'b', 'x')

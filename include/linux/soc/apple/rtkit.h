@@ -146,6 +146,43 @@ int apple_rtkit_adopt_running(struct apple_rtkit *rtk);
  */
 int apple_rtkit_set_ap_power_on(struct apple_rtkit *rtk);
 
+/* TIER-A (print-only diagnostic): RX counter snapshot. */
+struct apple_rtkit_tier_a_stats {
+	unsigned long mgmt;
+	unsigned long crashlog;
+	unsigned long syslog;
+	unsigned long debug;
+	unsigned long ioreport;
+	unsigned long unknown7;
+	unsigned long oslog;
+	unsigned long tracekit;
+	unsigned long app;
+	unsigned long other;
+	unsigned long alloc_fail;
+	int queued;
+};
+
+void apple_rtkit_tier_a_stats(struct apple_rtkit *rtk,
+			      struct apple_rtkit_tier_a_stats *st);
+
+/* CRASH-CAPTURE (print-only diagnostic): last endpoint-1 message
+ * record. seq == 0 means no endpoint-1 message has arrived yet. */
+struct apple_rtkit_crashlog_last {
+	u64 msg;
+	u8 type;
+	const char *class;
+	bool guard_fired;
+	dma_addr_t iova;
+	size_t size;
+	bool inherited;
+	bool crashed_after;
+	unsigned long seq;
+};
+
+void apple_rtkit_crashlog_last(struct apple_rtkit *rtk,
+			       struct apple_rtkit_crashlog_last *rec);
+u32 apple_rtkit_fifo_status(struct apple_rtkit *rtk, u32 *full_bit, u32 *empty_bit);
+
 /*
  * Quiesce the co-processor.
  */

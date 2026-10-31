@@ -44,5 +44,7 @@ void apple_mbox_stop(struct apple_mbox *mbox);
 int apple_mbox_poll(struct apple_mbox *mbox);
 int apple_mbox_send(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 		    bool atomic);
+u32 apple_mbox_a2i_control_status(struct apple_mbox *mbox, u32 *full_bit,
+				  u32 *empty_bit);
 
 #endif

@@ -266,6 +266,14 @@ static void apple_nvme_rtkit_crashed(void *cookie, const void *crashlog, size_t 
 {
 	struct apple_nvme *anv = cookie;
 
+	/* C12: genuine path's synchronous "after" CSTS, at callback
+	 * entry, BEFORE nvme_reset_ctrl(). Same register set as
+	 * ADOPT-CSTS-WATCH. */
+	dev_err(anv->dev, "ADOPT-CRASH-CSTS csts=%08x cc=%08x bst=%08x cpu=%08x\n",
+		readl(anv->mmio_nvme + NVME_REG_CSTS),
+		readl(anv->mmio_nvme + NVME_REG_CC),
+		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS),
+		readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL));
 	dev_warn(anv->dev, "RTKit crashed; unable to recover without a reboot");
 	nvme_reset_ctrl(&anv->ctrl);
 }
@@ -1147,6 +1155,47 @@ static void apple_nvme_init_queue(struct apple_nvme_queue *q)
 	wmb(); /* ensure the first interrupt sees the initialization */
 }
 
+/* TIER-A (print-only diagnostic, message-free CSTS watch). Read-only
+ * register reads + counter snapshot; no new message, no delay, no write. */
+static void apple_nvme_tier_a_watch(struct apple_nvme *anv, const char *point)
+{
+	struct apple_rtkit_tier_a_stats st;
+
+	apple_rtkit_tier_a_stats(anv->rtk, &st);
+	dev_err(anv->dev, "ADOPT-CSTS-WATCH %s csts=%08x cc=%08x bst=%08x cpu=%08x\n",
+		point,
+		readl(anv->mmio_nvme + NVME_REG_CSTS),
+		readl(anv->mmio_nvme + NVME_REG_CC),
+		readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS),
+		readl(anv->mmio_coproc + APPLE_ANS_COPROC_CPU_CONTROL));
+	dev_err(anv->dev, "ADOPT-RX-COUNT %s mgmt=%lu crashlog=%lu syslog=%lu debug=%lu ioreport=%lu unknown7=%lu oslog=%lu tracekit=%lu app=%lu other=%lu queued=%d allocfail=%lu\n",
+		point, st.mgmt, st.crashlog, st.syslog, st.debug, st.ioreport,
+		st.unknown7, st.oslog, st.tracekit, st.app, st.other, st.queued,
+		st.alloc_fail);
+	/* C13: last-crashlog record at EVERY Tier A watch point, so
+	 * the watch point before an endpoint-1 event (record still
+	 * old/zero) and the first watch point after it bracket the
+	 * event between two CSTS values. seq == 0 means no endpoint-1
+	 * message has arrived yet. */
+	{
+		struct apple_rtkit_crashlog_last rec;
+
+		apple_rtkit_crashlog_last(anv->rtk, &rec);
+		dev_err(anv->dev, "ADOPT-CRASH-LAST %s seq=%lu msg=%016llx type=%u class=%s guard_fired=%d iova=%pad size=%zu inherited=%d crashed_after=%d\n",
+			point, rec.seq, rec.msg, rec.type, rec.class ? rec.class : "NONE",
+			rec.guard_fired, &rec.iova, rec.size, rec.inherited, rec.crashed_after);
+	}
+}
+
+static void apple_nvme_tier_a_fifo(struct apple_nvme *anv, const char *point)
+{
+	u32 full = 0, empty = 0, ctrl;
+
+	ctrl = apple_rtkit_fifo_status(anv->rtk, &full, &empty);
+	dev_err(anv->dev, "ADOPT-FIFO %s ctrl=%08x full_bit=%08x empty_bit=%08x full=%d empty=%d\n",
+		point, ctrl, full, empty, !!(ctrl & full), !!(ctrl & empty));
+}
+
 static void apple_nvme_reset_work(struct work_struct *work)
 {
 	unsigned int nr_io_queues = 1;
@@ -1273,10 +1322,15 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			apple_sart_protected_mask(anv->sart),
 			readl(anv->mmio_nvme + NVME_REG_CC),
 			readl(anv->mmio_nvme + NVME_REG_CSTS));
+		/* TIER-A P-A1: ADOPT-PRE snapshot point. */
+		apple_nvme_tier_a_watch(anv, "ADOPT-PRE");
 		ret = apple_rtkit_adopt_running(anv->rtk);
 		if (!ret)
 			anv->adopted = true;
 		dev_err(anv->dev, "ADOPT-OK ret=%d adopted=%d\n", ret, anv->adopted);
+		/* TIER-A P-A1/P-A3: ADOPT-OK snapshot point + FIFO readback. */
+		apple_nvme_tier_a_watch(anv, "ADOPT-OK");
+		apple_nvme_tier_a_fifo(anv, "ADOPT-OK");
 	} else if (anv->hw->needs_ioq_register &&
 		   readl(anv->mmio_nvme + APPLE_ANS_BOOT_STATUS) ==
 		   APPLE_ANS_BOOT_STATUS_OK) {
@@ -1370,6 +1424,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 				readl(anv->mmio_nvme + NVME_REG_CSTS));
 		if (ret)
 			goto out;
+		/* TIER-A P-A1: after-disable snapshot point. */
+		apple_nvme_tier_a_watch(anv, "AFTER-DISABLE");
 	}
 
 	/* Setup the admin queue */
@@ -1389,6 +1445,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 	 * included at the top of this file. */
 	lo_hi_writeq(anv->adminq.sq_dma_addr, anv->mmio_nvme + NVME_REG_ASQ);
 	lo_hi_writeq(anv->adminq.cq_dma_addr, anv->mmio_nvme + NVME_REG_ACQ);
+	/* TIER-A P-A1: after-admin-queue-programming snapshot point. */
+	apple_nvme_tier_a_watch(anv, "AFTER-ADMINQ");
 
 	if (anv->hw->has_lsq_nvmmu) {
 		/* Setup NVMMU for both queues */
@@ -1396,6 +1454,8 @@ static void apple_nvme_reset_work(struct work_struct *work)
 			anv->mmio_nvmmu + APPLE_NVMMU_ASQ_TCB_BASE);
 		lo_hi_writeq(anv->ioq.tcb_dma_addr,
 			anv->mmio_nvmmu + APPLE_NVMMU_IOSQ_TCB_BASE);
+		/* TIER-A P-A1: after-TCB-programming snapshot point. */
+		apple_nvme_tier_a_watch(anv, "AFTER-TCB");
 	}
 
 	anv->ctrl.sqsize =
@@ -1519,6 +1579,9 @@ static void apple_nvme_reset_work(struct work_struct *work)
 		anv->hw->max_queue_depth,
 		anv->hw->needs_ioq_register);
 	dev_dbg(anv->dev, "Enabling controller now");
+	/* TIER-A P-A1/P-A3: PREENABLE snapshot point + FIFO readback. */
+	apple_nvme_tier_a_watch(anv, "PREENABLE");
+	apple_nvme_tier_a_fifo(anv, "PREENABLE");
 	ret = nvme_enable_ctrl(&anv->ctrl);
 	if (ret) {
 		/* raw31: did the CC enable write land? (read-only) */

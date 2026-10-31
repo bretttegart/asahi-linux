@@ -163,6 +163,18 @@ int apple_mbox_send(struct apple_mbox *mbox, const struct apple_mbox_msg msg,
 }
 EXPORT_SYMBOL(apple_mbox_send);
 
+/* TIER-A (print-only diagnostic): read-only A2I control register readback. */
+u32 apple_mbox_a2i_control_status(struct apple_mbox *mbox, u32 *full_bit,
+				  u32 *empty_bit)
+{
+	if (full_bit)
+		*full_bit = mbox->hw->control_full;
+	if (empty_bit)
+		*empty_bit = mbox->hw->control_empty;
+	return readl_relaxed(mbox->regs + mbox->hw->a2i_control);
+}
+EXPORT_SYMBOL(apple_mbox_a2i_control_status);
+
 static irqreturn_t apple_mbox_send_empty_irq(int irq, void *data)
 {
 	struct apple_mbox *mbox = data;

@@ -5,6 +5,8 @@
  */
 
 #include "rtkit-internal.h"
+#include <linux/ktime.h>
+#include <linux/printk.h>
 
 enum {
 	APPLE_RTKIT_PWR_STATE_OFF = 0x00, /* power off, cannot be restarted */
@@ -395,20 +397,83 @@ static void apple_rtkit_memcpy(struct apple_rtkit *rtk, void *dst,
 		memcpy(dst, bfr->buffer + offset, len);
 }
 
+/* CRASH-CAPTURE (print-only diagnostic): last endpoint-1 record,
+ * written on every endpoint-1 dispatch, read-only elsewhere. */
+static void apple_rtkit_crashlog_record(struct apple_rtkit *rtk, u64 msg,
+					u8 type, const char *class,
+					bool guard_fired)
+{
+	rtk->last_crashlog.msg = msg;
+	rtk->last_crashlog.type = type;
+	rtk->last_crashlog.class = class;
+	rtk->last_crashlog.guard_fired = guard_fired;
+	rtk->last_crashlog.iova = rtk->crashlog_buffer.iova;
+	rtk->last_crashlog.size = rtk->crashlog_buffer.size;
+	rtk->last_crashlog.inherited = rtk->crashlog_inherited;
+	rtk->last_crashlog.crashed_after = rtk->crashed;
+	rtk->last_crashlog.seq = rtk->rx_count_crashlog;
+}
+
+void apple_rtkit_crashlog_last(struct apple_rtkit *rtk,
+			       struct apple_rtkit_crashlog_last *rec)
+{
+	*rec = rtk->last_crashlog;
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_crashlog_last);
+
 static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 {
 	u8 type = FIELD_GET(APPLE_RTKIT_SYSLOG_TYPE, msg);
 	u8 *bfr __free(kfree) = NULL;
+	unsigned long seq = rtk->rx_count_crashlog;
+	const char *class;
+	bool guard_fired;
+
+	/* C1: receipt record, on EVERY endpoint-1 dispatch. */
+	dev_err(rtk->dev, "ADOPT-CRASH-RX seq=%lu msg=%016llx type=%u ts=%llu crashed_before=%d\n",
+		seq, msg, type, ktime_get_ns(), rtk->crashed);
+
+	/* C2/C3: classification + buffer state at entry. The class print
+	 * cites buffer-size state alongside the type value, never the
+	 * type alone: type 1 is a buffer-install when no buffer is
+	 * installed yet, and a crash message when one already is. */
+	if (type != APPLE_RTKIT_CRASHLOG_CRASH)
+		class = "UNKNOWN";
+	else if (!rtk->crashlog_buffer.size)
+		class = "BUFFER-INSTALL";
+	else if (rtk->crashlog_inherited && !rtk->crashlog_buffer.buffer &&
+		 !rtk->crashlog_buffer.iomem)
+		class = "GUARD-DROP";
+	else
+		class = "GENUINE-CRASH";
+	guard_fired = (type == APPLE_RTKIT_CRASHLOG_CRASH &&
+		       rtk->crashlog_buffer.size &&
+		       rtk->crashlog_inherited &&
+		       !rtk->crashlog_buffer.buffer &&
+		       !rtk->crashlog_buffer.iomem);
+	dev_err(rtk->dev, "ADOPT-CRASH-TYPE seq=%lu type=%u class=%s size_at_entry=%zu\n",
+		seq, type, class, rtk->crashlog_buffer.size);
+	dev_err(rtk->dev, "ADOPT-CRASH-BUF seq=%lu iova=%pad size=%zu buffer_present=%d iomem_present=%d is_mapped=%d inherited=%d\n",
+		seq, &rtk->crashlog_buffer.iova, rtk->crashlog_buffer.size,
+		!!rtk->crashlog_buffer.buffer, !!rtk->crashlog_buffer.iomem,
+		rtk->crashlog_buffer.is_mapped, rtk->crashlog_inherited);
 
 	if (type != APPLE_RTKIT_CRASHLOG_CRASH) {
 		dev_warn(rtk->dev, "RTKit: Unknown crashlog message: %llx\n",
 			 msg);
+		apple_rtkit_crashlog_record(rtk, msg, type, "UNKNOWN", false);
+		dev_err(rtk->dev, "ADOPT-CRASH-UNKNOWN seq=%lu msg=%016llx type=%u\n",
+			seq, msg, type);
 		return;
 	}
 
 	if (!rtk->crashlog_buffer.size) {
 		apple_rtkit_common_rx_get_buffer(rtk, &rtk->crashlog_buffer,
 						 APPLE_RTKIT_EP_CRASHLOG, msg);
+		apple_rtkit_crashlog_record(rtk, msg, type, "BUFFER-INSTALL", false);
+		dev_err(rtk->dev, "ADOPT-CRASH-INSTALL seq=%lu parsed_size=%zu parsed_iova=%pad preset_iova=%d inherited_after=%d\n",
+			seq, rtk->crashlog_buffer.size, &rtk->crashlog_buffer.iova,
+			!!rtk->crashlog_buffer.iova, rtk->crashlog_inherited);
 		return;
 	}
 
@@ -422,6 +487,11 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	if (rtk->crashlog_inherited && !rtk->crashlog_buffer.buffer &&
 	    !rtk->crashlog_buffer.iomem) {
 		dev_warn(rtk->dev, "RTKit: inherited crashlog message: buffer not CPU-visible, not re-read as new crash\n");
+		apple_rtkit_crashlog_record(rtk, msg, type, "GUARD-DROP", true);
+		dev_err(rtk->dev, "ADOPT-CRASH-GUARD seq=%lu iova=%pad size=%zu inherited=%d buffer_present=%d iomem_present=%d crashed_unchanged=%d ops_crashed_called=0\n",
+			seq, &rtk->crashlog_buffer.iova, rtk->crashlog_buffer.size,
+			rtk->crashlog_inherited, !!rtk->crashlog_buffer.buffer,
+			!!rtk->crashlog_buffer.iomem, rtk->crashed);
 		return;
 	}
 
@@ -436,15 +506,116 @@ static void apple_rtkit_crashlog_rx(struct apple_rtkit *rtk, u64 msg)
 	if (bfr) {
 		apple_rtkit_memcpy(rtk, bfr, &rtk->crashlog_buffer, 0,
 				   rtk->crashlog_buffer.size);
+		/* C7-C9: validation + bounded provenance print. The
+		 * validation gates ONLY these new prints, never the
+		 * existing dump below, which runs unconditionally. */
+		{
+			u8 raw[32];
+			u32 fourcc = 0, version = 0, hdr_size = 0, flags = 0;
+			u32 u0 = 0, u1 = 0, u2 = 0, u3 = 0;
+			bool valid = true;
+			const char *reason = "";
+			size_t offset;
+
+			memset(raw, 0, sizeof(raw));
+			if (!rtk->crashlog_buffer.buffer && !rtk->crashlog_buffer.iomem) {
+				valid = false;
+				reason = "not-cpu-visible";
+			} else if (rtk->crashlog_buffer.size < sizeof(raw)) {
+				valid = false;
+				reason = "short-buffer";
+			} else {
+				/* Read-only 32-byte probe of the firmware
+				 * buffer; no register write, no state change. */
+				apple_rtkit_memcpy(rtk, raw, &rtk->crashlog_buffer, 0,
+						   sizeof(raw));
+				memcpy(&fourcc, raw, 4);
+				memcpy(&version, raw + 4, 4);
+				memcpy(&hdr_size, raw + 8, 4);
+				memcpy(&flags, raw + 12, 4);
+				memcpy(&u0, raw + 16, 4);
+				memcpy(&u1, raw + 20, 4);
+				memcpy(&u2, raw + 24, 4);
+				memcpy(&u3, raw + 28, 4);
+				if (fourcc != APPLE_RTKIT_CRASHLOG_HEADER) {
+					valid = false;
+					reason = "bad-fourcc";
+				} else if (hdr_size < sizeof(raw) ||
+					   hdr_size > rtk->crashlog_buffer.size) {
+					valid = false;
+					reason = "bad-hdr-size";
+				} else {
+					/* V5: section walk must terminate
+					 * within hdr_size. */
+					offset = sizeof(raw);
+					while (offset + 16 <= hdr_size) {
+						u32 s_fourcc, s_size;
+
+						memcpy(&s_fourcc, bfr + offset, 4);
+						memcpy(&s_size, bfr + offset + 12, 4);
+						if (s_size < 16 || offset + s_size > hdr_size) {
+							valid = false;
+							reason = "bad-section";
+							break;
+						}
+						offset += s_size;
+					}
+				}
+			}
+			dev_err(rtk->dev, "ADOPT-CRASH-VALID seq=%lu verdict=%s fourcc=%08x version=%u hdr_size=%u flags=%u buf_size=%zu reason=%s\n",
+				seq, valid ? "PASS" : "FAIL", fourcc, version,
+				hdr_size, flags, rtk->crashlog_buffer.size, reason);
+			if (valid) {
+				int nsec = 0;
+
+				dev_err(rtk->dev, "ADOPT-CRASH-HEAD seq=%lu fourcc=%08x version=%u size=%u flags=%u unk=%08x%08x%08x%08x\n",
+					seq, fourcc, version, hdr_size, flags,
+					u0, u1, u2, u3);
+				offset = sizeof(raw);
+				while (offset + 16 <= hdr_size && nsec < 32) {
+					u32 s_fourcc, s_size;
+
+					memcpy(&s_fourcc, bfr + offset, 4);
+					memcpy(&s_size, bfr + offset + 12, 4);
+					dev_err(rtk->dev, "ADOPT-CRASH-SECT seq=%lu idx=%d fourcc=%08x size=%u\n",
+						seq, nsec, s_fourcc, s_size);
+					if (offset + s_size > hdr_size) {
+						dev_err(rtk->dev, "ADOPT-CRASH-SECT seq=%lu idx=%d overrun\n",
+							seq, nsec);
+						break;
+					}
+					offset += s_size;
+					nsec++;
+				}
+				/* NOTE: the design's print_hex_dump_bytes() is a
+				 * macro for print_hex_dump_debug(), which is a
+				 * no-op in this tree unless DEBUG or dynamic
+				 * debug is enabled for this unit (verified:
+				 * the call compiled to nothing and the
+				 * prefix string was absent from rtkit.o).
+				 * print_hex_dump(KERN_ERR, ...) keeps C9's
+				 * exact parameters (rowsize 16, groupsize 1,
+				 * ascii) but prints unconditionally, like
+				 * every other C-print (dev_err). */
+				print_hex_dump(KERN_ERR, "ADOPT-CRASH-HEX ", DUMP_PREFIX_OFFSET,
+					       16, 1, bfr, hdr_size < 512 ? hdr_size : 512, true);
+			}
+		}
 		apple_rtkit_crashlog_dump(rtk, bfr, rtk->crashlog_buffer.size);
 	} else {
 		dev_err(rtk->dev,
 			"RTKit: Couldn't allocate crashlog shadow buffer\n");
+		dev_err(rtk->dev, "ADOPT-CRASH-ALLOCFAIL seq=%lu buf_size=%zu\n",
+			seq, rtk->crashlog_buffer.size);
 	}
 
 	rtk->crashed = true;
 	if (rtk->ops->crashed)
 		rtk->ops->crashed(rtk->cookie, bfr, bfr ? rtk->crashlog_buffer.size : 0);
+	apple_rtkit_crashlog_record(rtk, msg, type, "GENUINE-CRASH", false);
+	dev_err(rtk->dev, "ADOPT-CRASH-DONE seq=%lu crashed=%d ops_crashed_called=%d shadow_size=%zu alloc_fail=%d\n",
+		seq, rtk->crashed, !!rtk->ops->crashed,
+		bfr ? rtk->crashlog_buffer.size : 0, !bfr);
 }
 
 static void apple_rtkit_ioreport_rx(struct apple_rtkit *rtk, u64 msg)
@@ -607,6 +778,41 @@ static void apple_rtkit_rx_work(struct work_struct *work)
 		container_of(work, struct apple_rtkit_rx_work, work);
 	struct apple_rtkit *rtk = rtk_work->rtk;
 
+	/* TIER-A: dispatch counting (print-only). */
+	atomic_dec(&rtk->rx_queued);
+	switch (rtk_work->ep) {
+	case APPLE_RTKIT_EP_MGMT:
+		rtk->rx_count_mgmt++;
+		break;
+	case APPLE_RTKIT_EP_CRASHLOG:
+		rtk->rx_count_crashlog++;
+		break;
+	case APPLE_RTKIT_EP_SYSLOG:
+		rtk->rx_count_syslog++;
+		break;
+	case APPLE_RTKIT_EP_DEBUG:
+		rtk->rx_count_debug++;
+		break;
+	case APPLE_RTKIT_EP_IOREPORT:
+		rtk->rx_count_ioreport++;
+		break;
+	case APPLE_RTKIT_EP_UNKNOWN7:
+		rtk->rx_count_unknown7++;
+		break;
+	case APPLE_RTKIT_EP_OSLOG:
+		rtk->rx_count_oslog++;
+		break;
+	case APPLE_RTKIT_EP_TRACEKIT:
+		rtk->rx_count_tracekit++;
+		break;
+	case APPLE_RTKIT_APP_ENDPOINT_START ... 0xff:
+		rtk->rx_count_app++;
+		break;
+	default:
+		rtk->rx_count_other++;
+		break;
+	}
+
 	switch (rtk_work->ep) {
 	case APPLE_RTKIT_EP_MGMT:
 		apple_rtkit_management_rx(rtk, rtk_work->msg);
@@ -670,8 +876,14 @@ static void apple_rtkit_rx(struct apple_mbox *mbox, struct apple_mbox_msg msg,
 		return;
 
 	work = kzalloc_obj(*work, GFP_ATOMIC);
-	if (!work)
+	if (!work) {
+		/* TIER-A P3: previously silent drop; now counted + printed. */
+		rtk->rx_alloc_fail++;
+		dev_err(rtk->dev, "RTKit: RX alloc failure (TIER-A P3) fail=%lu\n",
+			rtk->rx_alloc_fail);
 		return;
+	}
+	atomic_inc(&rtk->rx_queued);
 
 	work->rtk = rtk;
 	work->ep = ep;
@@ -1189,6 +1401,31 @@ void devm_apple_rtkit_free(struct device *dev, struct apple_rtkit *rtk)
 	devm_release_action(dev, apple_rtkit_free_wrapper, rtk);
 }
 EXPORT_SYMBOL_GPL(devm_apple_rtkit_free);
+
+/* TIER-A (print-only diagnostic): read-only stats + FIFO readback accessors. */
+void apple_rtkit_tier_a_stats(struct apple_rtkit *rtk,
+			      struct apple_rtkit_tier_a_stats *st)
+{
+	st->mgmt = rtk->rx_count_mgmt;
+	st->crashlog = rtk->rx_count_crashlog;
+	st->syslog = rtk->rx_count_syslog;
+	st->debug = rtk->rx_count_debug;
+	st->ioreport = rtk->rx_count_ioreport;
+	st->unknown7 = rtk->rx_count_unknown7;
+	st->oslog = rtk->rx_count_oslog;
+	st->tracekit = rtk->rx_count_tracekit;
+	st->app = rtk->rx_count_app;
+	st->other = rtk->rx_count_other;
+	st->alloc_fail = rtk->rx_alloc_fail;
+	st->queued = atomic_read(&rtk->rx_queued);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_tier_a_stats);
+
+u32 apple_rtkit_fifo_status(struct apple_rtkit *rtk, u32 *full_bit, u32 *empty_bit)
+{
+	return apple_mbox_a2i_control_status(rtk->mbox, full_bit, empty_bit);
+}
+EXPORT_SYMBOL_GPL(apple_rtkit_fifo_status);
 
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("Sven Peter <sven@svenpeter.dev>");
