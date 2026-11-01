@@ -158,6 +158,10 @@ struct hw_info {
 	u32 port_perst;
 	u32 port_rid2sid;
 	u32 port_msimap;
+	u32 port_ltssmctl;
+	bool no_line_irq;
+	bool no_gpio_perst;
+	bool t8132_compat;
 	u32 max_rid2sid;
 };
 
@@ -169,6 +173,7 @@ static const struct hw_info t8103_hw = {
 	.port_perst		= PORT_PERST,
 	.port_rid2sid		= PORT_RID2SID,
 	.port_msimap		= 0,
+	.port_ltssmctl		= PORT_LTSSMCTL,
 	.max_rid2sid		= 64,
 };
 
@@ -180,7 +185,29 @@ static const struct hw_info t602x_hw = {
 	.port_perst		= PORT_T602X_PERST,
 	.port_rid2sid		= PORT_T602X_RID2SID,
 	.port_msimap		= PORT_T602X_MSIMAP,
+	.port_ltssmctl		= PORT_LTSSMCTL,
 	/* 16 on t602x, guess for autodetect on future HW */
+	.max_rid2sid		= 512,
+};
+
+/* T8132: port layout matches t602x (APPCLK/PERST/MSIADDR/RID2SID/MSIMAP
+ * all proven live 2026-10-31) but the vendor LTSSM start at port+0x80
+ * wedges the SoC (diag boot froze exactly there; m1n1 skips LTSSM writes
+ * for T8122-compat too). Skip it; link training is attempted from
+ * config space instead.
+ */
+static const struct hw_info t8132_hw = {
+	.phy_lane_ctl		= 0,
+	.port_msiaddr		= PORT_T602X_MSIADDR,
+	.port_msiaddr_hi	= PORT_T602X_MSIADDR_HI,
+	.port_refclk		= 0,
+	.port_perst		= PORT_T602X_PERST,
+	.port_rid2sid		= PORT_T602X_RID2SID,
+	.port_msimap		= PORT_T602X_MSIMAP,
+	.port_ltssmctl		= 0,
+	.no_line_irq		= true,
+	.no_gpio_perst		= true,
+	.t8132_compat		= true,
 	.max_rid2sid		= 512,
 };
 
@@ -202,6 +229,7 @@ struct apple_pcie_port {
 	struct device_node	*np;
 	void __iomem		*base;
 	void __iomem		*phy;
+	void __iomem		*pport_phy;
 	struct irq_domain	*domain;
 	struct list_head	entry;
 	unsigned long		*sid_map;
@@ -393,6 +421,8 @@ static void apple_port_irq_handler(struct irq_desc *desc)
 	chained_irq_enter(chip, desc);
 
 	stat = readl_relaxed(port->base + PORT_INTSTAT);
+	msleep(30);
+	dev_info(port->pcie->dev, "WIFI-BLINK: IRQ-HANDLER-ENTER stat=%08lx\n", stat);
 
 	for_each_set_bit(i, &stat, 32)
 		generic_handle_domain_irq(port->domain, i);
@@ -424,6 +454,11 @@ static int apple_pcie_port_setup_irq(struct apple_pcie_port *port)
 	writel_relaxed(~0, port->base + PORT_INTSTAT);
 	writel_relaxed(~0, port->base + PORT_LINKCMDSTS);
 
+	if (pcie->hw->no_line_irq) {
+		msleep(30);
+		dev_info(pcie->dev, "WIFI-BLINK: LINE-IRQ-SKIPPED (INTSTAT read unproven on t8132)\n");
+		return 0;
+	}
 	irq_set_chained_handler_and_data(irq, apple_port_irq_handler, port);
 
 	/* Configure MSI base address */
@@ -453,6 +488,8 @@ static irqreturn_t apple_pcie_port_irq(int irq, void *data)
 	struct apple_pcie_port *port = data;
 	unsigned int hwirq = irq_domain_get_irq_data(port->domain, irq)->hwirq;
 
+	msleep(30);
+	dev_info(port->pcie->dev, "WIFI-BLINK: PORT-IRQ hwirq=%u\n", hwirq);
 	switch (hwirq) {
 	case PORT_INT_LINK_UP:
 		dev_info_ratelimited(port->pcie->dev, "Link up on %pOF\n",
@@ -480,6 +517,12 @@ static int apple_pcie_port_register_irqs(struct apple_pcie_port *port)
 		{ PORT_INT_LINK_DOWN,	"Link down",	},
 	};
 	int i;
+
+	if (port->pcie->hw->no_line_irq) {
+		msleep(30);
+		dev_info(port->pcie->dev, "WIFI-BLINK: CHILD-IRQS-SKIPPED\n");
+		return 0;
+	}
 
 	for (i = 0; i < ARRAY_SIZE(port_irqs); i++) {
 		struct irq_fwspec fwspec = {
@@ -514,19 +557,27 @@ static int apple_pcie_setup_refclk(struct apple_pcie *pcie,
 	if (pcie->hw->phy_lane_ctl)
 		rmw_set(PHY_LANE_CTL_CFGACC, port->phy + pcie->hw->phy_lane_ctl);
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: REFCLK0REQ-NEXT\n");
 	rmw_set(PHY_LANE_CFG_REFCLK0REQ, port->phy + PHY_LANE_CFG);
 
 	res = readl_relaxed_poll_timeout(port->phy + PHY_LANE_CFG,
 					 stat, stat & PHY_LANE_CFG_REFCLK0ACK,
 					 100, 50000);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: REFCLK1ACK ret=%d\n", res);
 	if (res < 0)
 		return res;
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: REFCLK1REQ-NEXT\n");
 	rmw_set(PHY_LANE_CFG_REFCLK1REQ, port->phy + PHY_LANE_CFG);
 	res = readl_relaxed_poll_timeout(port->phy + PHY_LANE_CFG,
 					 stat, stat & PHY_LANE_CFG_REFCLK1ACK,
 					 100, 50000);
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: REFCLK2ACK ret=%d\n", res);
 	if (res < 0)
 		return res;
 
@@ -554,11 +605,180 @@ static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
 	return readl_relaxed(port_rid2sid_addr(port, idx));
 }
 
+/* Mirror of m1n1's T8122-compat port init (src/pcie.c) — every write below
+ * is one m1n1 performed on this exact SoC in the same boot chain
+ * (2026-10-31). Linux's t602x-style setup released PERST without the
+ * per-port PHY bring-up and the machine wedged asynchronously on every
+ * attempt (v2..v8); this restores the proven sequence. */
+static int apple_pcie_t8132_compat_init(struct apple_pcie *pcie,
+					 struct apple_pcie_port *port)
+{
+	u32 stat, v;
+	int res;
+
+	if (!port->pport_phy)
+		return -ENODEV;
+
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-INIT-START\n");
+
+	/* Assert PERST# first (m1n1: +0x82c = 0) */
+	writel_relaxed(0x0, port->base + PORT_T602X_PERST);
+
+	writel_relaxed(0x110, port->base + 0x88);
+	writel_relaxed(0xffffffff, port->base + PORT_INTSTAT);
+	writel_relaxed(0xffffffff, port->base + 0x148);
+	writel_relaxed(0xffffffff, port->base + PORT_LINKCMDSTS);
+	writel_relaxed(0x0, port->base + 0x80);
+	writel_relaxed(0x0, port->base + 0x84);
+	writel_relaxed(0xfffffff0, port->base + PORT_INTMSK);
+	writel_relaxed(0x100, port->base + 0x124);
+	writel_relaxed(0x0, port->base + PORT_T602X_MSIADDR);
+	writel_relaxed(0x10, port->base + 0x13c);
+	writel_relaxed(0x100100, port->base + PORT_APPCLK);
+	writel_relaxed(0x1000ff, port->base + 0x808);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-CFG-WRITTEN\n");
+
+	for (int i = 0; i < 16; i++)
+		writel_relaxed(0, port->base + pcie->hw->port_rid2sid + 4 * i);
+	for (int i = 0; i < 512; i++)
+		writel_relaxed(0, port->base + pcie->hw->port_msimap + 4 * i);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-MAPS-ZEROED\n");
+
+	writel_relaxed(0x3000000, port->base + 0x130);
+	writel_relaxed(0x10, port->base + 0x140);
+	writel_relaxed(0x253770, port->base + 0x144);
+	writel_relaxed(0x0, port->base + 0x21c);
+	writel_relaxed(0x0, port->base + 0x834);
+	writel_relaxed(0x0, port->base + 0x83c);
+	writel_relaxed(0x100101, port->base + PORT_APPCLK);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-SPEED-APPCLK-WRITTEN\n");
+
+	/* per-port PHY refclk + un-reset (m1n1 T8122-compat) */
+	v = readl_relaxed(port->pport_phy);
+	v &= ~(PHY_LANE_CFG_REFCLK0REQ | PHY_LANE_CFG_REFCLK1REQ);
+	writel_relaxed(v, port->pport_phy);
+	v |= PHY_LANE_CFG_REFCLK0REQ;
+	writel_relaxed(v, port->pport_phy);
+	res = readl_relaxed_poll_timeout(port->pport_phy, stat,
+					 stat & PHY_LANE_CFG_REFCLK0ACK,
+					 100, 50000);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-PPHY-CLK0 res=%d\n", res);
+	if (res < 0)
+		return res;
+	v |= PHY_LANE_CFG_REFCLK1REQ;
+	writel_relaxed(v, port->pport_phy);
+	res = readl_relaxed_poll_timeout(port->pport_phy, stat,
+					 stat & PHY_LANE_CFG_REFCLK1ACK,
+					 100, 50000);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-PPHY-CLK1 res=%d\n", res);
+	if (res < 0)
+		return res;
+	v &= ~0x10;		/* APCIE_PHY_CTRL_RESET_T8132 */
+	writel_relaxed(v, port->pport_phy);
+	v |= 0x200;
+	writel_relaxed(v, port->pport_phy);
+	v |= 0x400;
+	writel_relaxed(v, port->pport_phy);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-PPHY-UNRESET\n");
+
+	/* m1n1: apcie-config-tunables: port_base+0x140 set bit0 */
+	writel_relaxed((readl_relaxed(port->base + 0x140) & ~1) | 1, port->base + 0x140);
+
+	/* Release PERST# (m1n1: set32 RESET_DIS) */
+	writel_relaxed(PORT_PERST_OFF, port->base + PORT_T602X_PERST);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-PERST-RELEASED\n");
+
+	res = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
+					 stat & PORT_STATUS_READY,
+					 100, 250000);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-READY res=%d stat=%08x\n", res, stat);
+	if (res < 0)
+		return res;
+
+	/* m1n1: poll LINKSTS BUSY (bit3) clear, 250ms */
+	res = readl_relaxed_poll_timeout(port->base + PORT_LINKSTS, stat,
+					 !(stat & BIT(3)),
+					 100, 250000);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-IDLE res=%d stat=%08x\n", res, stat);
+
+	/* v15: m1n1 already applied the full DBI/tunable/speed config earlier
+	 * in this same boot chain (kboot pcie_init). Re-applying it under Linux
+	 * wedged the SoC (v14); skipping it survives (v13). Preserve the m1n1
+	 * state; do not touch config space from the init path. */
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-INIT-DONE (m1n1 state preserved)\n");
+	return 0;
+	{
+		struct resource *cfg_res;
+		void __iomem *cfg;
+		u32 r;
+
+		cfg_res = platform_get_resource_byname(to_platform_device(pcie->dev),
+						       IORESOURCE_MEM, "config");
+		/* plain ioremap: the ECAM core owns/requests this region later */
+		cfg = ioremap(cfg_res->start, resource_size(cfg_res));
+		if (IS_ERR(cfg))
+			return PTR_ERR(cfg);
+
+		/* DBI RO unlock */
+		writel_relaxed(readl_relaxed(cfg + 0x8bc) | BIT(0), cfg + 0x8bc);
+
+		/* pcie-rc-tunables */
+		r = readl_relaxed(cfg + 0x078); writel_relaxed((r & ~0x7000) | 0, cfg + 0x078);
+		r = readl_relaxed(cfg + 0x8c4); writel_relaxed((r & ~0x03000000) | 0x03000000, cfg + 0x8c4);
+		r = readl_relaxed(cfg + 0xb80); writel_relaxed((r & ~0x007f0000) | 0x001f0000, cfg + 0xb80);
+		/* gen3 shadow */
+		r = readl_relaxed(cfg + 0x154); writel_relaxed((r & ~0x00000f0f) | 0x00000404, cfg + 0x154);
+		r = readl_relaxed(cfg + 0x890); writel_relaxed(r & ~0x03000000, cfg + 0x890);
+		r = readl_relaxed(cfg + 0x8a8); writel_relaxed((r & ~0x00ffff0f) | 0x1, cfg + 0x8a8);
+		/* gen4 shadow */
+		r = readl_relaxed(cfg + 0x178); writel_relaxed((r & ~0x000000ff) | 0x44, cfg + 0x178);
+		r = readl_relaxed(cfg + 0x890); writel_relaxed((r & ~0x03000000) | 0x01000000, cfg + 0x890);
+		r = readl_relaxed(cfg + 0x8a8); writel_relaxed((r & ~0x00ffff0f) | 0x1, cfg + 0x8a8);
+		msleep(30);
+		dev_info(pcie->dev, "WIFI-BLINK: T8132-RC-TUNABLES-APPLIED\n");
+
+		/* max link speed = 2 (ADT bridge0) */
+		r = readl_relaxed(cfg + 0x7c); writel_relaxed((r & ~0xf) | 2, cfg + 0x7c);
+		r = readl_relaxed(cfg + 0x9c); writel_relaxed((r & ~0x7e) | (3 << 1), cfg + 0x9c);
+		r = readl_relaxed(cfg + 0xa0); writel_relaxed((r & ~0xf) | 2, cfg + 0xa0);
+		/* link width 1, speed change */
+		r = readl_relaxed(cfg + 0x80c); writel_relaxed((r & ~BIT(17)) | BIT(17), cfg + 0x80c);
+		r = readl_relaxed(cfg + 0x710); writel_relaxed((r & ~0x003f0000) | 0x00010000, cfg + 0x710);
+		r = readl_relaxed(cfg + 0x80c); writel_relaxed((r & ~0x1f00) | 0x100, cfg + 0x80c);
+		r = readl_relaxed(cfg + 0x7c); writel_relaxed((r & ~0x3f0) | (1 << 4), cfg + 0x7c);
+		msleep(30);
+		dev_info(pcie->dev, "WIFI-BLINK: T8132-SPEED-WIDTH-SET\n");
+
+		/* DBI RO relock */
+		writel_relaxed(readl_relaxed(cfg + 0x8bc) & ~BIT(0), cfg + 0x8bc);
+	}
+
+	/* m1n1: final LINKSTS read */
+	stat = readl_relaxed(port->base + PORT_LINKSTS);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: T8132-INIT-DONE stat=%08x\n", stat);
+	return 0;
+}
+
 static int apple_pcie_setup_link(struct apple_pcie *pcie,
 				 struct apple_pcie_port *port,
 				 struct device_node *np)
 {
 #define MAX_AUX_PERST 3
+
+	if (pcie->hw->t8132_compat)
+		return apple_pcie_t8132_compat_init(pcie, port);
 	struct gpio_desc *aux_reset[MAX_AUX_PERST] = { NULL };
 	u32 num_aux_resets = 0;
 	struct gpio_desc *reset, *pwren = NULL;
@@ -601,17 +821,31 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 			return PTR_ERR(pwren);
 	}
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: APPCLK-NEXT\n");
 	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
 
 	/* Assert PERST# before setting up the clock */
-	gpiod_set_value_cansleep(reset, 1);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: PERST-ASSERT-NEXT\n");
+	if (!pcie->hw->no_gpio_perst)
+		gpiod_set_value_cansleep(reset, 1);
+	else
+		msleep(30);
+		dev_info(pcie->dev, "WIFI-BLINK: PERST-GPIO-SKIPPED\n");
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: PERST-ASSERTED\n");
 	for (u32 idx = 0; idx < num_aux_resets; idx++)
 		gpiod_set_value_cansleep(aux_reset[idx], 1);
 
 	/* Power on the device if required */
 	gpiod_set_value_cansleep(pwren, 1);
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: REFCLK-NEXT\n");
 	ret = apple_pcie_setup_refclk(pcie, port);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: REFCLK-DONE ret=%d\n", ret);
 	if (ret < 0)
 		return ret;
 
@@ -625,14 +859,19 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 		usleep_range(100, 200);
 
 	/* Deassert PERST# */
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: PERST-DEASSERT-NEXT\n");
 	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
-	gpiod_set_value_cansleep(reset, 0);
+	if (!pcie->hw->no_gpio_perst)
+		gpiod_set_value_cansleep(reset, 0);
 	for (u32 idx = 0; idx < num_aux_resets; idx++)
 		gpiod_set_value_cansleep(aux_reset[idx], 0);
 
 	/* Wait for 100ms after PERST# deassertion (PCIe r5.0, 6.6.1) */
 	msleep(100);
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: READY-POLL-NEXT\n");
 	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
 					 stat & PORT_STATUS_READY, 100, 250000);
 	if (ret < 0) {
@@ -688,8 +927,15 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	else
 		port->phy = pcie->base + CORE_PHY_DEFAULT_BASE(port->idx);
 
+	snprintf(name, sizeof(name), "pport-phy%d", port->idx);
+	res = platform_get_resource_byname(platform, IORESOURCE_MEM, name);
+	if (res)
+		port->pport_phy = devm_ioremap_resource(&platform->dev, res);
+
 	/* link might be already brought up by u-boot, skip setup then */
 	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: LINKSTS-ENTRY=%08x\n", link_stat);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
 		ret = apple_pcie_setup_link(pcie, port, np);
 		if (ret)
@@ -703,11 +949,15 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: IRQ-NEXT\n");
 	ret = apple_pcie_port_setup_irq(port);
 	if (ret)
 		return ret;
 
 	/* Reset all RID/SID mappings, and check for RAZ/WI registers */
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: RID2SID-NEXT\n");
 	for (i = 0; i < pcie->hw->max_rid2sid; i++) {
 		if (apple_pcie_rid2sid_write(port, i, 0xbad1d) != 0xbad1d)
 			break;
@@ -724,17 +974,60 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	/* In the success path, we keep a reference to np around */
 	of_node_get(np);
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: REGIRQ-NEXT\n");
 	ret = apple_pcie_port_register_irqs(port);
 	WARN_ON(ret);
 
 	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: LINKSTS-ENTRY=%08x\n", link_stat);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
 		unsigned long timeout, left;
 		/* start link training */
-		writel_relaxed(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: LTSSM-START-NEXT\n");
+		if (pcie->hw->port_ltssmctl) {
+			msleep(30);
+			dev_info(pcie->dev, "WIFI-BLINK: LTSSM-START-NEXT\n");
+			writel_relaxed(PORT_LTSSMCTL_START, port->base + pcie->hw->port_ltssmctl);
 
-		timeout = link_up_timeout * HZ / 1000;
-		left = wait_for_completion_timeout(&pcie->event, timeout);
+			msleep(30);
+			dev_info(pcie->dev, "WIFI-BLINK: WAIT-NEXT to=%dms\n", link_up_timeout);
+			timeout = link_up_timeout * HZ / 1000;
+			left = wait_for_completion_timeout(&pcie->event, timeout);
+			msleep(30);
+			dev_info(pcie->dev, "WIFI-BLINK: WAIT-RETURNED left=%lu\n", left);
+		} else {
+			/* T8132: link trains autonomously after PERST release
+			 * (m1n1 T8122-compat: no LTSSM write; polls LINKSTS BUSY).
+			 * Poll the m1n1-proven LINKSTS register instead of waiting
+			 * on an IRQ we deliberately never enable. */
+			int up;
+			msleep(30);
+			dev_info(pcie->dev, "WIFI-BLINK: LINK-POLL-START\n");
+			{
+				int it;
+				for (it = 0; it < 500; it++) {
+					link_stat = readl_relaxed(port->base + PORT_LINKSTS);
+					msleep(30);
+					dev_info(pcie->dev, "WIFI-BLINK: POLL it=%d stat=%08x\n", it, link_stat);
+					if (link_stat & PORT_LINKSTS_UP)
+						break;
+					usleep_range(1000, 2000);
+				}
+				ret = (link_stat & PORT_LINKSTS_UP) ? 0 : -ETIMEDOUT;
+			}
+			up = !ret;
+			link_stat = readl_relaxed(port->base + PORT_LINKSTS);
+			msleep(30);
+			dev_info(pcie->dev, "WIFI-BLINK: LINK-POLL-DONE up=%d stat=%08x\n",
+				 up, link_stat);
+			if (up)
+				dev_info(pcie->dev, "%pOF link up (polled)\n", np);
+			else
+				dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
+		}
 		if (!left)
 			dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
 		else
@@ -743,6 +1036,8 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 
 	}
 
+	msleep(30);
+	dev_info(pcie->dev, "WIFI-BLINK: PORT-DONE\n");
 	return 0;
 }
 
@@ -911,7 +1206,20 @@ static int apple_pcie_init(struct pci_config_window *cfg)
 		}
 	}
 
+	msleep(30);
+	dev_info(dev, "WIFI-BLINK: ALL-PORTS-OK\n");
 	return 0;
+}
+
+static void __iomem *apple_pcie_map_bus(struct pci_bus *bus,
+					    unsigned int devfn, int where)
+{
+	void __iomem *addr = pci_ecam_map_bus(bus, devfn, where);
+
+	dev_info(bus->bridge->parent ? bus->bridge->parent : bus->bridge,
+		 "WIFI-BLINK: CFG bus=%02x devfn=%02x where=%03x\n",
+		 bus->number, devfn, where);
+	return addr;
 }
 
 static const struct pci_ecam_ops apple_pcie_cfg_ecam_ops = {
@@ -919,7 +1227,7 @@ static const struct pci_ecam_ops apple_pcie_cfg_ecam_ops = {
 	.enable_device	= apple_pcie_enable_device,
 	.disable_device	= apple_pcie_disable_device,
 	.pci_ops	= {
-		.map_bus	= pci_ecam_map_bus,
+		.map_bus	= apple_pcie_map_bus,
 		.read		= pci_generic_config_read,
 		.write		= pci_generic_config_write,
 	}
@@ -986,10 +1294,14 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	msleep(30);
+	dev_info(dev, "WIFI-BLINK: ECAM-SCAN-NEXT\n");
+
 	return pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
 }
 
 static const struct of_device_id apple_pcie_of_match[] = {
+	{ .compatible = "apple,t8132-pcie",	.data = &t8132_hw },
 	{ .compatible = "apple,t6020-pcie",	.data = &t602x_hw },
 	{ .compatible = "apple,pcie",		.data = &t8103_hw },
 	{ }
