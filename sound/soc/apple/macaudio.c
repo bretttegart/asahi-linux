@@ -270,7 +270,22 @@ static int macaudio_vlimit_unlock(struct macaudio_snd_data *ma, bool unlock)
 	}
 
 	if (unlock && ma->cfg->amp == AMP_SN012776 && ma->cfg->tweeter_vol_limit) {
+		/* J604 has two woofers per side ("Woofer 1"/"Woofer 2"), so the
+		 * plain "* Woofer Speaker Volume" pattern matches nothing and
+		 * snd_soc_limit_volume fails with -EINVAL. Apply the woofer
+		 * limit to both numbered variants (and the unnumbered one,
+		 * for machines with a single woofer per side). */
 		ret = snd_soc_limit_volume(&ma->card, "* Woofer Speaker Volume",
+					  SN012776_DB(ma->cfg->woofer_vol_limit));
+		if (ret < 0 && ret != -EINVAL)
+			goto error;
+
+		ret = snd_soc_limit_volume(&ma->card, "* Woofer 1 Speaker Volume",
+					  SN012776_DB(ma->cfg->woofer_vol_limit));
+		if (ret < 0)
+			goto error;
+
+		ret = snd_soc_limit_volume(&ma->card, "* Woofer 2 Speaker Volume",
 					  SN012776_DB(ma->cfg->woofer_vol_limit));
 		if (ret < 0)
 			goto error;
@@ -1770,6 +1785,18 @@ static const struct macaudio_platform_cfg macaudio_j713_cfg = {
 	.tweeter_vol_limit = -22,
 };
 
+static const struct macaudio_platform_cfg macaudio_j604_cfg = {
+	.enable_speakers = true,
+	.amp = AMP_SN012776,
+	.speakers = SPKR_2W1T,
+	.stereo = true,
+	.amp_gain = 15,
+	.safe_vol = -20,
+	/* Same precaution as J713 while J604 speaker protection is validated. */
+	.woofer_vol_limit = -14,
+	.tweeter_vol_limit = -22,
+};
+
 struct macaudio_platform_cfg macaudio_j415_cfg = {
 	true,	AMP_SN012776,	SPKR_2W1T,	true,	15,	-20,
 };
@@ -1865,6 +1892,8 @@ static const struct of_device_id macaudio_snd_device_id[]  = {
 	/* j615    AID21   sn012776    15      2x 2W+1T Compat: apple,j415-macaudio */
 	/* j713    -       sn012776    15      2× 1W+1T (T8132 layout) */
 	{ .compatible = "apple,j713-macaudio", .data = &macaudio_j713_cfg },
+	/* j604    -       sn012776    15      2x 2W+1T (T8132 layout) */
+	{ .compatible = "apple,j604-macaudio", .data = &macaudio_j604_cfg },
 	/* Fallback, jack only */
 	{ .compatible = "apple,macaudio"},
 	{ }
