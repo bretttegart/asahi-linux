@@ -11,6 +11,7 @@
 
 #include "t8132.dtsi"
 #include "t8132-jxxx.dtsi"
+#include "t8132-mtp.dtsi"
 #include <dt-bindings/leds/common.h>
 
 / {
@@ -112,5 +113,196 @@
 				remote-endpoint = <&dwc3_3_ss>;
 			};
 		};
+	};
+};
+
+&mtp {
+	status = "okay";
+};
+
+&mtp_mbox {
+	status = "okay";
+};
+
+&mtp_dart {
+	status = "okay";
+};
+
+&mtp_dockchannel {
+	status = "okay";
+};
+
+&mtp_hid {
+	status = "okay";
+	wakeup-source;
+
+	multi-touch {
+		firmware-name = "apple/tpmtfw-j604.bin";
+		/* J713 uses SMC gP1c (0x1c), active-low AFE reset; J604 TBD. */
+		reset-gpios = <&smc_gpio 0x1c GPIO_ACTIVE_LOW>;
+	};
+
+	keyboard: keyboard {
+		hid-country-code = <0>;
+		apple,keyboard-layout-id = <0>;
+	};
+
+	stm {
+	};
+
+	actuator {
+	};
+
+	tp-accel {
+	};
+
+	mtp {
+	};
+};
+
+&bluetooth0 {
+	brcm,board-type = "apple,guam";
+};
+
+/* J604 audio: 6x TAS2764 (sn012776) speaker amps + CS42L84 headphone jack.
+ * I2C addresses, sense slots and TDM masks from the J604 live ADT.
+ * Amps on i2c3 (0x38-0x3d), jack codec on i2c1 (0x4b).
+ * Same GPIOs as J713 (T8132): codec reset nub 17, codec IRQ ap 98, SDZ ap 15.
+ */
+/ {
+	sound {
+		compatible = "apple,j604-macaudio", "apple,macaudio";
+		model = "MacBook Pro J604";
+
+		dai-link@0 {
+			link-name = "Speakers";
+			/*
+			 * The MCA receives sense data from both ports at once, and
+			 * a port's line keeps its last level after its amps' slots.
+			 * As in the ADT amp-tx-zd-config, the first amp on each
+			 * port drives zeros in the other port's slots.
+			 */
+			dai-tdm-idle-mode-0 = "zero";
+			dai-tdm-idle-mode-2 = "zero";
+			dai-tdm-slot-tx-idle-mask-0 = <0xfff0f0f0>;
+			dai-tdm-slot-tx-idle-mask-2 = <0xff0f0f0f>;
+
+			cpu {
+				sound-dai = <&mca 0>, <&mca 1>;
+			};
+			codec {
+				sound-dai = <&amp_left_woofer1>, <&amp_left_woofer2>,
+					    <&amp_left_tweeter>,
+					    <&amp_right_woofer1>, <&amp_right_woofer2>,
+					    <&amp_right_tweeter>;
+			};
+		};
+
+		dai-link@1 {
+			link-name = "Headphone Jack";
+
+			cpu {
+				sound-dai = <&mca 2>;
+			};
+			codec {
+				sound-dai = <&jack_codec>;
+			};
+		};
+	};
+
+	speaker_sdz_supply: regulator-speaker-sdz {
+		compatible = "regulator-fixed";
+		regulator-name = "speaker-sdz";
+		gpio = <&pinctrl_ap 15 GPIO_ACTIVE_HIGH>;
+		enable-active-high;
+		startup-delay-us = <2000>;
+	};
+};
+
+&admac {
+	status = "okay";
+};
+
+&mca {
+	status = "okay";
+	/* Speakers and their sense on cluster 0, the jack on cluster 2 */
+	dmas = <&admac 0>, <&admac 1>, <&admac 4>;
+	dma-names = "tx0a", "rx0b", "tx2a";
+};
+
+&i2c3 {
+	status = "okay";
+
+	amp_left_woofer1: amplifier@38 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x38>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 1";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <0>;
+		ti,imon-slot-no = <2>;
+	};
+
+	amp_left_woofer2: amplifier@39 {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x39>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Woofer 2";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <4>;
+		ti,imon-slot-no = <6>;
+	};
+
+	amp_left_tweeter: amplifier@3a {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3a>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Left Tweeter";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <8>;
+		ti,imon-slot-no = <10>;
+	};
+
+	amp_right_woofer1: amplifier@3b {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3b>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 1";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <12>;
+		ti,imon-slot-no = <14>;
+	};
+
+	amp_right_woofer2: amplifier@3c {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3c>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Woofer 2";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <16>;
+		ti,imon-slot-no = <18>;
+	};
+
+	amp_right_tweeter: amplifier@3d {
+		compatible = "ti,sn012776", "ti,tas2764";
+		reg = <0x3d>;
+		#sound-dai-cells = <0>;
+		sound-name-prefix = "Right Tweeter";
+		SDZ-supply = <&speaker_sdz_supply>;
+		ti,vmon-slot-no = <20>;
+		ti,imon-slot-no = <22>;
+	};
+};
+
+&i2c1 {
+	status = "okay";
+
+	jack_codec: codec@4b {
+		compatible = "cirrus,cs42l84";
+		reg = <0x4b>;
+		#sound-dai-cells = <0>;
+		reset-gpios = <&pinctrl_nub 17 GPIO_ACTIVE_HIGH>;
+		interrupts-extended = <&pinctrl_ap 98 IRQ_TYPE_LEVEL_LOW>;
+		sound-name-prefix = "Jack";
 	};
 };
