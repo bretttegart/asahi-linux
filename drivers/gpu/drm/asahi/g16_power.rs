@@ -76,6 +76,8 @@ impl Platform {
         if out.len() < 0xb758 || self.period_ms == 0 {
             return Err(EINVAL);
         }
+        // DEBUG
+        kernel::pr_info!("G16DBG: power_data start, period_ms={} period_clocks={} max_pstate={} maximum_power={}\n", self.period_ms, self.period_clocks, self.max_pstate(), self.maximum_power);
         // The property spellings and defaults follow the Python reader exactly.
         macro_rules! uint {
             ($name:literal, $default:expr) => {
@@ -268,11 +270,13 @@ impl Platform {
 
         // Fast-die uses the untruncated AIC interval, unlike the other loops.
         let fast_dt = F32::from(self.period_clocks) / f32!(24000.0) / f32!(1000.0);
+        kernel::pr_info!("G16DBG: power_data reached fast_die section\n");
         let (limit, release) = crate::g16_thermal::fast_die_limits(
             crate::module_parameters::fast_die_limit_c.value(),
             uint!("gpu-fast-die0-release-temp", 80),
         )
         .ok_or(EINVAL)?;
+        kernel::pr_info!("G16DBG: power_data fast_die_limits ok limit={} release={}\n", limit, release);
         let delta = uint!("gpu-fast-die0-prop-tgt-delta", 0);
         if delta > u32::MAX / 100 {
             return Err(EINVAL);

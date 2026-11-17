@@ -399,18 +399,25 @@ impl Bootstrap {
         crate::g16_mesh::Mode::from_parameter(crate::module_parameters::native_mesh.value())
             .ok_or(EINVAL)?;
         validate_boot_resources(pdev)?;
-        let platform = crate::g16_platform::Platform::new(pdev.as_ref())?;
+        dev_info!(pdev.as_ref(), "G16DBG: contract ok, Platform::new next\n");
+        let platform = crate::g16_platform::Platform::new(pdev.as_ref()).map_err(|e| { dev_err!(pdev.as_ref(), "G16DBG: Platform::new failed: {:?}\n", e); e })?;
+        dev_info!(pdev.as_ref(), "G16DBG: Platform::new ok, bundle next\n");
         // All board inputs are checked before any firmware is started.
         // SAFETY: get_random_u32 has no preconditions.
-        let mut bundle = platform.bundle(unsafe { kernel::bindings::get_random_u32() })?;
+        let mut bundle = platform.bundle(unsafe { kernel::bindings::get_random_u32() }).map_err(|e| { dev_err!(pdev.as_ref(), "G16DBG: bundle failed: {:?}\n", e); e })?;
+        dev_info!(pdev.as_ref(), "G16DBG: bundle ok, region_c next\n");
         // The firmware Timestamp handler accepts user destinations only in
         // this 64 MiB aperture, based at header+0x28.
         bundle[0x28..0x30].copy_from_slice(&crate::g16_fw::TIMESTAMP_BASE.to_le_bytes());
-        let region_c = platform.region_c()?;
+        let region_c = platform.region_c().map_err(|e| { dev_err!(pdev.as_ref(), "G16DBG: region_c failed: {:?}\n", e); e })?;
+        dev_info!(pdev.as_ref(), "G16DBG: region_c ok, AddressSpace next\n");
         let dev = pdev.as_ref();
-        let mut address_space = crate::g16_vm::AddressSpace::new()?;
-        address_space.check_geometry(dev)?;
-        address_space.check_borrowed_root(dev)?;
+        let mut address_space = crate::g16_vm::AddressSpace::new().map_err(|e| { dev_err!(pdev.as_ref(), "G16DBG: AddressSpace::new failed: {:?}\n", e); e })?;
+        dev_info!(pdev.as_ref(), "G16DBG: AddressSpace ok, check_geometry next\n");
+        address_space.check_geometry(dev).map_err(|e| { dev_err!(pdev.as_ref(), "G16DBG: check_geometry failed: {:?}\n", e); e })?;
+        dev_info!(pdev.as_ref(), "G16DBG: check_geometry ok, check_borrowed_root next\n");
+        address_space.check_borrowed_root(dev).map_err(|e| { dev_err!(pdev.as_ref(), "G16DBG: check_borrowed_root failed: {:?}\n", e); e })?;
+        dev_info!(pdev.as_ref(), "G16DBG: check_borrowed_root ok, asc next\n");
         let asc = pdev
             .io_request_by_name(c_str!("asc"))
             .ok_or(EINVAL)?
